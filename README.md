@@ -676,6 +676,22 @@ if (client.EnabledCapabilities.Contains(IrcCapabilities.SERVER_TIME))
 
 ## Changelog
 
+### v2.3.0
+
+**Breaking — Namespace Rename:**
+- All namespaces renamed from `IRCDotNet.*` to `IRCDotNet.Core.*` to match the NuGet package name
+- `using IRCDotNet;` → `using IRCDotNet.Core;`
+- `using IRCDotNet.Configuration;` → `using IRCDotNet.Core.Configuration;`
+- `using IRCDotNet.Events;` → `using IRCDotNet.Core.Events;`
+- `using IRCDotNet.Protocol;` → `using IRCDotNet.Core.Protocol;`
+- `using IRCDotNet.Transport;` → `using IRCDotNet.Core.Transport;`
+- `using IRCDotNet.Utilities;` → `using IRCDotNet.Core.Utilities;`
+
+**Other Changes:**
+- Repository moved to https://github.com/etushar89/IRCDotNet.Core
+- CTCP SOURCE auto-reply URL updated to new repo
+- Removed `Roslynator.Analyzers` dev dependency
+
 ### v2.2.0
 
 **New Events:**

@@ -8,7 +8,7 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <PackageId>IRCDotNet.Core</PackageId>
-    <Version>2.2.0</Version>
+    <Version>2.3.0</Version>
     <Authors>Tushar Sudake</Authors>
     <Description>Modern .NET 8 IRC client library with full IRCv3 support — SASL, message tags, capabilities negotiation, CTCP (VERSION/PING/ACTION), WebSocket and TCP/SSL transports, rate limiting, auto-reconnect, and 39 typed events. Based on RFC 1459 and the Modern IRC Client Protocol.</Description>
     <PackageTags>irc;irc-client;ircv3;internet-relay-chat;chat;networking;sasl;protocol;real-time;async;event-driven;rate-limiting;auto-reconnect;websocket;ctcp;dotnet;csharp</PackageTags>
@@ -17,15 +17,13 @@
     <Copyright>Copyright (c) 2026 Tushar Sudake</Copyright>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageReleaseNotes>
-v2.2.0:
-- New events: InviteReceived, OwnAwayStatusChanged (305/306), ChannelModeIsReceived (324), ErrorReplyReceived (catch-all)
-- Fix: ERR_NOCHANMODES (477) and ERR_TOOMANYCHANNELS (405) now route to ChannelJoinFailed
-- Fix: ERR_CHANOPRIVSNEEDED (482), ERR_NOTONCHANNEL (442), ERR_NEEDMOREPARAMS (461) now route to ErrorReplyReceived
-- Fix: Case-insensitive channel dictionary per RFC 2812
-- Fix: RPL_NOTOPIC (331) now fires TopicChanged with empty topic
-- Fix: INVITE command handling added
-- RPL_TOPICWHOTIME (333) now logged
-- 754 unit tests (42 new)
+v2.3.0:
+- BREAKING: Namespaces renamed to match package name (IRCDotNet -> IRCDotNet.Core)
+  Update: using IRCDotNet; -> using IRCDotNet.Core;
+  Update: using IRCDotNet.Events; -> using IRCDotNet.Core.Events; (etc.)
+- Repository moved to https://github.com/etushar89/IRCDotNet.Core
+- CTCP SOURCE auto-reply URL updated
+- Removed Roslynator.Analyzers dependency
 
 Full changelog: https://github.com/etushar89/IRCDotNet.Core
     </PackageReleaseNotes>
