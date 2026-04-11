@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/IRCDotNet.Core/IRCDotNet.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/IRCDotNetCore.ConcurrencyTests/IRCDotNetCore.ConcurrencyTests.csproj" />
+    <Project Path="tests/IRCDotNetCore.Tests/IRCDotNetCore.Tests.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,35 @@
+<Project>
+  <PropertyGroup>
+    <PlatformTarget>x64</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <Platform>x64</Platform>
+
+    <!-- Enable format verification during build -->
+    <EnableFormatVerification Condition="'$(EnableFormatVerification)' == ''">true</EnableFormatVerification>
+    <!-- Treat formatting issues as errors in CI -->
+    <TreatWarningsAsErrors Condition="'$(CI)' == 'true'">true</TreatWarningsAsErrors>
+
+    <!-- Localization: Support only English (en) locale -->
+    <AssemblyNeutralResourcesLanguage>en</AssemblyNeutralResourcesLanguage>
+
+    <!-- Static analysis -->
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+  </PropertyGroup>
+  <Target Name="FormatVerification" BeforeTargets="Build" Condition="'$(EnableFormatVerification)' == 'true' and '$(DesignTimeBuild)' != 'true'">
+    <Message Text="Verifying code formatting..." Importance="high" />
+
+    <!-- Run dotnet format with verify-no-changes to check formatting -->
+    <Exec Command="dotnet format --verify-no-changes --verbosity minimal"
+			ContinueOnError="false"
+			IgnoreExitCode="false"
+			WorkingDirectory="$(MSBuildThisFileDirectory)" />
+  </Target>
+  <!-- Development convenience target to format code -->
+  <Target Name="Format">
+    <Message Text="Formatting code..." Importance="high" />
+    <Exec Command="dotnet format --verbosity minimal"
+			WorkingDirectory="$(MSBuildThisFileDirectory)" />
+  </Target>
+</Project>

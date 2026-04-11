@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Platforms>AnyCPU;x64</Platforms>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <PackageId>IRCDotNet.Core</PackageId>
+    <Version>2.2.0</Version>
+    <Authors>Tushar Sudake</Authors>
+    <Description>Modern .NET 8 IRC client library with full IRCv3 support — SASL, message tags, capabilities negotiation, CTCP (VERSION/PING/ACTION), WebSocket and TCP/SSL transports, rate limiting, auto-reconnect, and 39 typed events. Based on RFC 1459 and the Modern IRC Client Protocol.</Description>
+    <PackageTags>irc;irc-client;ircv3;internet-relay-chat;chat;networking;sasl;protocol;real-time;async;event-driven;rate-limiting;auto-reconnect;websocket;ctcp;dotnet;csharp</PackageTags>
+    <RepositoryUrl>https://github.com/etushar89/IRCDotNet.Core</RepositoryUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <Copyright>Copyright (c) 2026 Tushar Sudake</Copyright>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageReleaseNotes>
+v2.2.0:
+- New events: InviteReceived, OwnAwayStatusChanged (305/306), ChannelModeIsReceived (324), ErrorReplyReceived (catch-all)
+- Fix: ERR_NOCHANMODES (477) and ERR_TOOMANYCHANNELS (405) now route to ChannelJoinFailed
+- Fix: ERR_CHANOPRIVSNEEDED (482), ERR_NOTONCHANNEL (442), ERR_NEEDMOREPARAMS (461) now route to ErrorReplyReceived
+- Fix: Case-insensitive channel dictionary per RFC 2812
+- Fix: RPL_NOTOPIC (331) now fires TopicChanged with empty topic
+- Fix: INVITE command handling added
+- RPL_TOPICWHOTIME (333) now logged
+- 754 unit tests (42 new)
+
+Full changelog: https://github.com/etushar89/IRCDotNet.Core
+    </PackageReleaseNotes>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="README.md" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Options" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="8.0.0" />
+    <PackageReference Include="System.Text.Json" Version="8.0.5" />
+  </ItemGroup>
+
+</Project>

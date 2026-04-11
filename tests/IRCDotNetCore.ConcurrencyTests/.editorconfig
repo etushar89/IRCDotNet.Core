@@ -1,0 +1,10 @@
+root = false
+
+[*.cs]
+# Suppress ConfigureAwait(false) requirement in test projects
+# Tests typically run in environments where the SynchronizationContext doesn't matter
+dotnet_diagnostic.RCS1090.severity = none
+dotnet_diagnostic.CA2007.severity = none
+
+# Suppress empty catch clause warnings in tests - intentional for testing error scenarios
+dotnet_diagnostic.RCS1075.severity = none
