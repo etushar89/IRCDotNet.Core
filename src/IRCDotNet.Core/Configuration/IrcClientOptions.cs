@@ -87,7 +87,7 @@ public class SaslOptions
 }
 
 /// <summary>
-/// Configuration options for an <see cref="IRCDotNet.IrcClient"/> connection.
+/// Configuration options for an <see cref="IrcClient"/> connection.
 /// </summary>
 public class IrcClientOptions
 {
@@ -270,7 +270,7 @@ public class IrcClientOptions
     public bool EnableBatchProcessing { get; set; } = true;
 
     /// <summary>
-    /// Whether to process IRCv3 message tags and fire <see cref="IRCDotNet.IrcClient.MessageTagsReceived"/> events. Default: <c>true</c>.
+    /// Whether to process IRCv3 message tags and fire <see cref="IrcClient.MessageTagsReceived"/> events. Default: <c>true</c>.
     /// </summary>
     public bool EnableMessageTags { get; set; } = true;
 
@@ -296,8 +296,8 @@ public class IrcClientOptions
 
     /// <summary>
     /// WebSocket URI for connecting via WebSocket transport (e.g. <c>"wss://irc.unrealircd.org/"</c>).
-    /// When set, the client uses <see cref="IRCDotNet.Transport.WebSocketIrcTransport"/> instead of
-    /// <see cref="IRCDotNet.Transport.TcpIrcTransport"/>. The <see cref="Server"/> and <see cref="Port"/> properties
+    /// When set, the client uses <see cref="IRCDotNet.Core.Transport.WebSocketIrcTransport"/> instead of
+    /// <see cref="IRCDotNet.Core.Transport.TcpIrcTransport"/>. The <see cref="Server"/> and <see cref="Port"/> properties
     /// are not used for connection but are still available for display/logging purposes.
     /// When <c>null</c> (default), connects via raw TCP.
     /// </summary>

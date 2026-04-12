@@ -1,6 +1,6 @@
 # IRCDotNet.Core — Modern .NET 8 IRC Client Library
 
-A production-ready, thread-safe [IRC (Internet Relay Chat)](https://en.wikipedia.org/wiki/IRC) client library for .NET 8 with comprehensive IRCv3 support, full IntelliSense documentation, and zero external dependencies beyond `Microsoft.Extensions.Logging.Abstractions`.
+A production-ready, thread-safe [IRC (Internet Relay Chat)](https://en.wikipedia.org/wiki/IRC) client library for .NET 8 with comprehensive IRCv3 support, full IntelliSense documentation, and no runtime dependencies beyond `Microsoft.Extensions.*` 8.0 and `System.Text.Json`.
 
 Build chat applications, notification relays, channel monitors, IRC-to-Discord bridges, or any tool that needs real-time IRC connectivity.
 
@@ -13,7 +13,7 @@ dotnet add package IRCDotNet.Core
 ## Features
 
 - **RFC 1459 + Modern IRC** — Complete protocol implementation with ISUPPORT parsing
-- **IRCv3 Capabilities** — SASL, message-tags, server-time, away-notify, account-notify, extended-join, cap-notify, chghost, batch, labeled-response, echo-message, monitor, setname
+- **IRCv3 Capabilities** — SASL, message-tags, server-time, away-notify, account-notify, extended-join, cap-notify, chghost, batch, echo-message, monitor, setname, invite-notify, labeled-response (negotiated)
 - **WebSocket Transport** — Connect via `wss://` or `ws://` endpoints (UnrealIRCd, InspIRCd, KiwiIRC gateways) alongside traditional TCP/SSL
 - **SASL Authentication** — PLAIN and EXTERNAL mechanisms with automatic CAP negotiation
 - **NickServ IDENTIFY** — Reactive identification triggered by NickServ prompts
@@ -498,6 +498,8 @@ Exception hierarchy:
   - `IrcAuthenticationException` — password/SASL failures
   - `IrcTargetNotFoundException`, `IrcChannelNotFoundException` — target doesn't exist
   - `IrcUnknownCommandException`, `IrcNotRegisteredException`, `IrcAlreadyRegisteredException`
+  - `IrcInsufficientParametersException` — not enough parameters for a command
+  - `IrcValidationException` — input validation failures
 
 ### Configure Rate Limiting
 
@@ -675,6 +677,20 @@ if (client.EnabledCapabilities.Contains(IrcCapabilities.SERVER_TIME))
 | Lifecycle | `Dispose`, `DisposeAsync` |
 
 ## Changelog
+
+### v2.3.1
+
+**Bug Fixes:**
+- `IrcEncoding.StripIrcFormatting` now delegates to `IrcFormattingStripper.Strip` — handles full set of formatting codes (hex colors `\x04`, monospace `\x11`, strikethrough `\x1E`) instead of the incomplete manual parser
+- Fixed `\x0312` hex escape bug in tests (C# parses as U+0312, not `\x03` + `12` — same class of bug as the CTCP `\x01AC` issue)
+- Fixed 4 broken XML doc `cref` links in `IrcClientOptions` after namespace rename
+- Added missing XML docs on 5 public members in example files
+
+**Docs:**
+- README: corrected dependency claim ("zero external" → accurate list)
+- README: added `invite-notify` to IRCv3 capabilities list, clarified `labeled-response` as negotiation-only
+- README: completed exception hierarchy (added `IrcInsufficientParametersException`, `IrcValidationException`)
+- Zero build warnings (0 CS1574, 0 CS1591)
 
 ### v2.3.0
 

@@ -115,81 +115,16 @@ public static class IrcEncoding
     }
 
     /// <summary>
-    /// Removes all IRC formatting control codes (bold, color, italic, underline, reverse) from a string, returning plain text.
+    /// Removes all IRC formatting control codes (bold, color, hex color, italic,
+    /// underline, strikethrough, monospace, reverse, reset) from a string, returning plain text.
+    /// Delegates to <see cref="IRCDotNet.Core.Utilities.IrcFormattingStripper.Strip"/> which handles
+    /// the full set of mIRC and IRCv3 formatting codes.
     /// </summary>
     /// <param name="input">The text potentially containing IRC formatting codes.</param>
     /// <returns>The plain text with all formatting stripped.</returns>
     public static string StripIrcFormatting(string input)
     {
-        if (string.IsNullOrEmpty(input))
-            return string.Empty;
-
-        var sb = new StringBuilder(input.Length);
-        var i = 0;
-
-        while (i < input.Length)
-        {
-            var c = input[i];
-
-            switch (c)
-            {
-                case '\x02': // Bold
-                case '\x0F': // Reset
-                case '\x16': // Reverse
-                case '\x1D': // Italic
-                case '\x1F': // Underline
-                    // Skip formatting character
-                    i++;
-                    break;
-
-                case '\x03': // Color
-                    // Skip color character and following color codes
-                    i++;
-                    // Skip foreground color (up to 2 digits)
-                    var colorDigits = 0;
-                    while (i < input.Length && char.IsDigit(input[i]) && colorDigits < 2)
-                    {
-                        i++;
-                        colorDigits++;
-                    }
-                    // Check for comma and background color
-                    if (i < input.Length && input[i] == ',')
-                    {
-                        i++; // Skip comma
-                        colorDigits = 0;
-                        while (i < input.Length && char.IsDigit(input[i]) && colorDigits < 2)
-                        {
-                            i++;
-                            colorDigits++;
-                        }
-                    }
-                    break;
-
-                case '\x0312': // Handle the Unicode character that represents "\x0312" in the test
-                    // This appears to be how C# interprets "\x0312" in the test string
-                    // Skip this character and following color codes
-                    i++;
-                    // Skip comma and background color if present
-                    if (i < input.Length && input[i] == ',')
-                    {
-                        i++; // Skip comma
-                        var bgColorDigits = 0;
-                        while (i < input.Length && char.IsDigit(input[i]) && bgColorDigits < 2)
-                        {
-                            i++;
-                            bgColorDigits++;
-                        }
-                    }
-                    break;
-
-                default:
-                    sb.Append(c);
-                    i++;
-                    break;
-            }
-        }
-
-        return sb.ToString();
+        return Utilities.IrcFormattingStripper.Strip(input);
     }
 
     /// <summary>

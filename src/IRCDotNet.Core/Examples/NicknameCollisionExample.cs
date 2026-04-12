@@ -8,11 +8,12 @@ namespace IRCDotNet.Core.Examples;
 
 /// <summary>
 /// Example demonstrating nickname collision handling (ERR_NICKCOLLISION - 436)
-/// This example shows how the IRCDotNet library handles nickname collisions
+/// This example shows how the IRCDotNet.Core library handles nickname collisions
 /// during connection registration and runtime.
 /// </summary>
 public class NicknameCollisionExample
 {
+    /// <summary>Example entry point demonstrating nickname collision handling.</summary>
     public static async Task Main(string[] args)
     {
         // Set up logging to see what's happening

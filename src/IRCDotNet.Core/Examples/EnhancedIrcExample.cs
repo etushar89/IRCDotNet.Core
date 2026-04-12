@@ -10,10 +10,11 @@ using Microsoft.Extensions.Logging;
 namespace IRCDotNet.Core.Examples;
 
 /// <summary>
-/// Enhanced example demonstrating modern IRCDotNet features
+/// Enhanced example demonstrating modern IRCDotNet.Core features
 /// </summary>
 public static class EnhancedIrcExample
 {
+    /// <summary>Example entry point demonstrating all enhanced features.</summary>
     public static async Task Main(string[] args)
     {
         // Example 1: Simple bot with builder pattern
@@ -334,12 +335,14 @@ public class ExampleBotService : IHostedService
     private readonly IrcClient _client;
     private readonly ILogger<ExampleBotService> _logger;
 
+    /// <summary>Initializes the bot service with an IRC client and logger.</summary>
     public ExampleBotService(IrcClient client, ILogger<ExampleBotService> logger)
     {
         _client = client;
         _logger = logger;
     }
 
+    /// <inheritdoc />
     public async Task StartAsync(CancellationToken cancellationToken)
     {
         _logger.LogInformation("Starting example bot service");
@@ -369,6 +372,7 @@ public class ExampleBotService : IHostedService
         await _client.ConnectAsync(cancellationToken).ConfigureAwait(false);
     }
 
+    /// <inheritdoc />
     public async Task StopAsync(CancellationToken cancellationToken)
     {
         _logger.LogInformation("Stopping example bot service");

@@ -77,7 +77,7 @@ public class IrcEncodingTests
     public void StripIrcFormatting_WithFormatting_RemovesFormatting()
     {
         // Arrange
-        var input = "Hello\x02World\x0F\x0312Red Text\x0F";
+        var input = "Hello\x02World\x0F\u000312Red Text\x0F";
 
         // Act
         var result = IrcEncoding.StripIrcFormatting(input);
@@ -90,7 +90,7 @@ public class IrcEncodingTests
     public void StripIrcFormatting_WithColorCodes_RemovesColorCodes()
     {
         // Arrange
-        var input = "\x0312,4Red on Blue\x0F";
+        var input = "\u000312,4Red on Blue\x0F";
 
         // Act
         var result = IrcEncoding.StripIrcFormatting(input);
