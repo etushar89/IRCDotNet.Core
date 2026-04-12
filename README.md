@@ -26,6 +26,7 @@ dotnet add package IRCDotNet.Core
 - **Multi-Client Management** — `IrcBotManager` as an `IHostedService` for managing multiple connections
 - **Protocol Utilities** — IRC case mapping, message validation, encoding helpers, formatting strippers
 - **CTCP Support** — ACTION (`/me`), VERSION, PING, TIME, CLIENTINFO, FINGER, SOURCE, USERINFO, ERRMSG with configurable auto-replies
+- **Testable** — `IIrcClient` interface for dependency injection and unit testing with Moq/NSubstitute
 - **Full IntelliSense** — Every public member documented with `<summary>`, `<param>`, and `<returns>` tags
 
 ## Quick Start
@@ -676,7 +677,125 @@ if (client.EnabledCapabilities.Contains(IrcCapabilities.SERVER_TIME))
 | Server Info | `GetServerNetworkName`, `GetServerMaxNicknameLength`, `GetServerMaxChannelLength`, `GetServerChannelTypes` |
 | Lifecycle | `Dispose`, `DisposeAsync` |
 
+## Testing & Mocking
+
+The library exposes `IIrcClient` — an interface covering all public methods, properties, and events. Inject it into your services and mock it in unit tests with Moq, NSubstitute, or any mocking framework.
+
+### Inject the interface
+
+```csharp
+// Your application service depends on the interface, not the concrete class
+using IRCDotNet.Core;
+using IRCDotNet.Core.Events;
+
+public class NotificationService
+{
+    private readonly IIrcClient _irc;
+
+    public NotificationService(IIrcClient irc)
+    {
+        _irc = irc;
+        _irc.PrivateMessageReceived += OnMessage;
+    }
+
+    public async Task SendAlertAsync(string channel, string text)
+    {
+        if (_irc.IsConnected)
+            await _irc.SendMessageAsync(channel, $"[ALERT] {text}");
+    }
+
+    private void OnMessage(object? sender, PrivateMessageEvent e)
+    {
+        if (e.Text == "!status")
+            _ = _irc.SendMessageAsync(e.Target, $"Connected: {_irc.IsConnected}");
+    }
+}
+```
+
+### Mock with Moq
+
+```csharp
+using Moq;
+using IRCDotNet.Core;
+using IRCDotNet.Core.Events;
+
+[Fact]
+public async Task SendAlertAsync_WhenConnected_SendsMessage()
+{
+    var mock = new Mock<IIrcClient>();
+    mock.Setup(c => c.IsConnected).Returns(true);
+    mock.Setup(c => c.SendMessageAsync(It.IsAny<string>(), It.IsAny<string>()))
+        .Returns(Task.CompletedTask);
+
+    var service = new NotificationService(mock.Object);
+    await service.SendAlertAsync("#ops", "Server restarting");
+
+    mock.Verify(c => c.SendMessageAsync("#ops", "[ALERT] Server restarting"), Times.Once);
+}
+
+[Fact]
+public async Task SendAlertAsync_WhenDisconnected_DoesNotSend()
+{
+    var mock = new Mock<IIrcClient>();
+    mock.Setup(c => c.IsConnected).Returns(false);
+
+    var service = new NotificationService(mock.Object);
+    await service.SendAlertAsync("#ops", "Test");
+
+    mock.Verify(c => c.SendMessageAsync(It.IsAny<string>(), It.IsAny<string>()), Times.Never);
+}
+```
+
+### Mock events
+
+```csharp
+using Moq;
+using IRCDotNet.Core;
+using IRCDotNet.Core.Events;
+using IRCDotNet.Core.Protocol;
+
+[Fact]
+public void OnMessage_StatusCommand_RepliesWithConnectionState()
+{
+    var mock = new Mock<IIrcClient>();
+    mock.Setup(c => c.IsConnected).Returns(true);
+    mock.Setup(c => c.SendMessageAsync(It.IsAny<string>(), It.IsAny<string>()))
+        .Returns(Task.CompletedTask);
+
+    var service = new NotificationService(mock.Object);
+
+    // Simulate an incoming message by raising the event on the mock
+    var rawMsg = IrcMessage.Parse(":user!u@host PRIVMSG #ops :!status");
+    var eventArgs = new PrivateMessageEvent(rawMsg, "user", "u", "host", "#ops", "!status");
+    mock.Raise(c => c.PrivateMessageReceived += null, mock.Object, eventArgs);
+
+    mock.Verify(c => c.SendMessageAsync("#ops", "Connected: True"), Times.Once);
+}
+```
+
+### DI registration
+
+`AddIrcClient()` registers both the concrete `IrcClient` and the `IIrcClient` interface:
+
+```csharp
+services.AddIrcClient(builder => builder
+    .WithNick("MyBot")
+    .AddServer("irc.libera.chat", 6697, useSsl: true));
+
+// Your services can inject either:
+public class MyService(IIrcClient irc) { }    // ✅ mockable
+public class MyService(IrcClient client) { }  // also works, but not mockable
+```
+
 ## Changelog
+
+### v2.4.0
+
+**New Features:**
+- `IIrcClient` interface — enables dependency injection and unit testing with Moq/NSubstitute
+- `IrcClient` now implements `IIrcClient` (6 properties, 37 methods, 33 events)
+- `AddIrcClient()` DI extension registers both `IrcClient` and `IIrcClient`
+- README: Testing & Mocking section with Moq examples
 
 ### v2.3.1
 

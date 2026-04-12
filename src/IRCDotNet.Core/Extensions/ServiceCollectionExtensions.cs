@@ -50,6 +50,7 @@ public static class ServiceCollectionExtensions
 
         services.AddSingleton(options);
         services.AddSingleton<IrcClient>();
+        services.AddSingleton<IIrcClient>(sp => sp.GetRequiredService<IrcClient>());
         services.AddSingleton<IEventDispatcher, ThreadedEventDispatcher>();
 
         return services;

@@ -8,7 +8,7 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <PackageId>IRCDotNet.Core</PackageId>
-    <Version>2.3.1</Version>
+    <Version>2.4.0</Version>
     <Authors>Tushar Sudake</Authors>
     <Description>Modern .NET 8 IRC client library with full IRCv3 support — SASL, message tags, capabilities negotiation, CTCP (VERSION/PING/ACTION), WebSocket and TCP/SSL transports, rate limiting, auto-reconnect, and 39 typed events. Based on RFC 1459 and the Modern IRC Client Protocol.</Description>
     <PackageTags>irc;irc-client;ircv3;internet-relay-chat;chat;networking;sasl;protocol;real-time;async;event-driven;rate-limiting;auto-reconnect;websocket;ctcp;dotnet;csharp</PackageTags>
@@ -17,13 +17,11 @@
     <Copyright>Copyright (c) 2026 Tushar Sudake</Copyright>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageReleaseNotes>
-v2.3.1:
-- Fix: IrcEncoding.StripIrcFormatting now delegates to IrcFormattingStripper (handles hex colors, monospace, strikethrough)
-- Fix: \x0312 hex escape bug in tests (same class as CTCP \x01AC issue)
-- Fix: broken XML doc cref links after namespace rename
-- Fix: missing XML docs on example public members
-- Docs: README dependency claim corrected, exception hierarchy completed, labeled-response clarified
-- Zero build warnings
+v2.4.0:
+- New: IIrcClient interface for dependency injection and unit testing (mockable with Moq/NSubstitute)
+- IrcClient now implements IIrcClient (6 properties, 37 methods, 33 events)
+- DI: AddIrcClient() registers both IrcClient and IIrcClient
+- Docs: Testing and Mocking section with Moq examples
 
 Full changelog: https://github.com/etushar89/IRCDotNet.Core#changelog
     </PackageReleaseNotes>

@@ -15,7 +15,7 @@ namespace IRCDotNet.Core;
 /// IRC (Internet Relay Chat) client implementing RFC 1459, the Modern IRC Client Protocol, and IRCv3 extensions.
 /// Provides async connect/disconnect, channel management, messaging, SASL authentication, rate limiting, and auto-reconnect.
 /// </summary>
-public class IrcClient : IDisposable, IAsyncDisposable
+public class IrcClient : IIrcClient
 {
     private static readonly Regex NickUserHostRegex = new(@"^([^!]+)!([^@]+)@(.+)$", RegexOptions.Compiled);
 
