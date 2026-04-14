@@ -1099,3 +1099,65 @@ public class ErrorReplyEvent : IrcEvent
         ErrorMessage = errorMessage;
     }
 }
+
+/// <summary>
+/// Typing state values for the <c>+typing</c> client tag (IRCv3).
+/// </summary>
+public enum TypingState
+{
+    /// <summary>The user is actively typing.</summary>
+    Active,
+    /// <summary>The user paused typing but has not cleared their input.</summary>
+    Paused,
+    /// <summary>The user cleared their input without sending a message.</summary>
+    Done
+}
+
+/// <summary>
+/// Event raised when a <c>+typing</c> notification is received via TAGMSG (IRCv3 client tag).
+/// Indicates whether a user is currently typing in a channel or private message.
+/// </summary>
+/// <remarks>
+/// <para>Clients should assume the sender is still typing until one of:</para>
+/// <list type="bullet">
+///   <item>A message is received from the sender</item>
+///   <item>The sender leaves the channel or quits</item>
+///   <item>A <c>typing=done</c> notification is received</item>
+///   <item>6 seconds elapse since the last <c>typing=active</c> notification</item>
+///   <item>30 seconds elapse since the last <c>typing=paused</c> notification</item>
+/// </list>
+/// </remarks>
+public class TypingIndicatorEvent : IrcEvent
+{
+    /// <summary>Nickname of the user whose typing state changed.</summary>
+    public string Nick { get; }
+    /// <summary>Username (ident) of the user.</summary>
+    public string User { get; }
+    /// <summary>Hostname of the user.</summary>
+    public string Host { get; }
+    /// <summary>Where the user is typing (channel name or the client's own nickname for private messages).</summary>
+    public string Target { get; }
+    /// <summary>The typing state: <see cref="TypingState.Active"/>, <see cref="TypingState.Paused"/>, or <see cref="TypingState.Done"/>.</summary>
+    public TypingState State { get; }
+    /// <summary>Whether this typing notification is for a channel (vs. a private message).</summary>
+    public bool IsChannelTyping => Target.StartsWith('#') || Target.StartsWith('&');
+
+    /// <summary>
+    /// Initializes a new <see cref="TypingIndicatorEvent"/>.
+    /// </summary>
+    /// <param name="message">The raw IRC message.</param>
+    /// <param name="nick">Nickname of the user.</param>
+    /// <param name="user">Username (ident) of the user.</param>
+    /// <param name="host">Hostname of the user.</param>
+    /// <param name="target">Channel name or nickname where the user is typing.</param>
+    /// <param name="state">The typing state.</param>
+    public TypingIndicatorEvent(IrcMessage message, string nick, string user, string host, string target, TypingState state)
+        : base(message)
+    {
+        Nick = nick;
+        User = user;
+        Host = host;
+        Target = target;
+        State = state;
+    }
+}

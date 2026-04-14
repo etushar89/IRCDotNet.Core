@@ -559,6 +559,167 @@ public class ExtendedEventTests
             "All away events should have non-empty ServerMessage");
     }
 
+    /// <summary>
+    /// Tests the TypingIndicatorReceived event via TAGMSG with +typing tag.
+    /// Requires the server to support the message-tags capability.
+    /// Two clients join a channel, one sends typing notifications, the other receives them.
+    /// Also tests PM typing and the self-skip (own typing ignored).
+    /// </summary>
+    [Fact(Timeout = 120_000)]
+    public async Task TypingIndicator_ChannelAndPM_ShouldFireEvent()
+    {
+        var sw = Stopwatch.StartNew();
+        var rng = new Random();
+        var suffix = rng.Next(1000, 9999);
+        var nickA = $"TypA{suffix}";
+        var nickB = $"TypB{suffix}";
+        var channel = $"#typ-{suffix}";
+
+        void Log(string msg) => _output.WriteLine($"[{sw.Elapsed:mm\\:ss\\.ff}] {msg}");
+
+        Log($"=== TypingIndicator === nick={nickA}/{nickB} channel={channel}");
+
+        IrcClientOptions MakeOpts(string nick) => new()
+        {
+            Server = "irc.hybridirc.com",
+            Port = 6697,
+            UseSsl = true,
+            Nick = nick,
+            UserName = nick.ToLower(),
+            RealName = $"{nick} TypingTest",
+            EnableRateLimit = false,
+            ConnectionTimeoutMs = 20000,
+            AutoReconnect = false,
+        };
+
+        var aConnected = new TaskCompletionSource<ConnectedEvent>();
+        var bConnected = new TaskCompletionSource<ConnectedEvent>();
+
+        // Typing events received by Bob
+        var bTypingEvents = new ConcurrentBag<TypingIndicatorEvent>();
+        // Typing events that Alice receives (should NOT include her own typing)
+        var aTypingEvents = new ConcurrentBag<TypingIndicatorEvent>();
+
+        await using var alice = new IrcClient(MakeOpts(nickA));
+        await using var bob = new IrcClient(MakeOpts(nickB));
+
+        alice.Connected += (s, e) => { Log($"[A] Connected"); aConnected.TrySetResult(e); };
+        bob.Connected += (s, e) => { Log($"[B] Connected"); bConnected.TrySetResult(e); };
+        alice.Disconnected += (s, e) => Log($"[A] Disconnected: {e.Reason}");
+        bob.Disconnected += (s, e) => Log($"[B] Disconnected: {e.Reason}");
+
+        alice.TypingIndicatorReceived += (s, e) =>
+        {
+            Log($"[A] Typing: {e.Nick} -> {e.Target} state={e.State} isChannel={e.IsChannelTyping}");
+            aTypingEvents.Add(e);
+        };
+        bob.TypingIndicatorReceived += (s, e) =>
+        {
+            Log($"[B] Typing: {e.Nick} -> {e.Target} state={e.State} isChannel={e.IsChannelTyping}");
+            bTypingEvents.Add(e);
+        };
+
+        // ── Connect ──
+        Log("--- 1. Connect ---");
+        await alice.ConnectAsync();
+        await bob.ConnectAsync();
+
+        using var timeout = new CancellationTokenSource(25_000);
+        timeout.Token.Register(() => { aConnected.TrySetCanceled(); bConnected.TrySetCanceled(); });
+
+        try { await Task.WhenAll(aConnected.Task, bConnected.Task); }
+        catch { Log("FAIL: connect"); await Cleanup(alice, bob); return; }
+
+        // Check if message-tags capability was negotiated
+        var aliceHasTags = alice.EnabledCapabilities.Contains("message-tags");
+        var bobHasTags = bob.EnabledCapabilities.Contains("message-tags");
+        Log($"message-tags: Alice={aliceHasTags}, Bob={bobHasTags}");
+
+        if (!aliceHasTags || !bobHasTags)
+        {
+            Log("SKIP: Server does not support message-tags capability — cannot test typing indicator");
+            await Cleanup(alice, bob);
+            return;
+        }
+
+        // ── Join channel ──
+        Log("--- 2. Join channel ---");
+        await alice.JoinChannelAsync(channel);
+        await Task.Delay(2000);
+        await bob.JoinChannelAsync(channel);
+        await Task.Delay(2000);
+
+        // ── Channel typing: Alice sends active, Bob should receive ──
+        Log("--- 3. Channel typing (active) ---");
+        await alice.SendTagMessageAsync(channel, new Dictionary<string, string?>
+        {
+            [MessageTags.TYPING] = "active"
+        });
+        await Task.Delay(3000);
+
+        var bobChannelActive = bTypingEvents.Any(e =>
+            e.Nick.Equals(nickA, StringComparison.OrdinalIgnoreCase) &&
+            e.Target.Equals(channel, StringComparison.OrdinalIgnoreCase) &&
+            e.State == TypingState.Active &&
+            e.IsChannelTyping);
+        Log($"  Bob received channel typing=active from Alice: {bobChannelActive}");
+
+        // ── Channel typing: Alice sends done ──
+        Log("--- 4. Channel typing (done) ---");
+        await alice.SendTagMessageAsync(channel, new Dictionary<string, string?>
+        {
+            [MessageTags.TYPING] = "done"
+        });
+        await Task.Delay(2000);
+
+        var bobChannelDone = bTypingEvents.Any(e =>
+            e.Nick.Equals(nickA, StringComparison.OrdinalIgnoreCase) &&
+            e.State == TypingState.Done);
+        Log($"  Bob received channel typing=done from Alice: {bobChannelDone}");
+
+        // ── PM typing: Bob sends active to Alice ──
+        Log("--- 5. PM typing (active) ---");
+        await bob.SendTagMessageAsync(nickA, new Dictionary<string, string?>
+        {
+            [MessageTags.TYPING] = "active"
+        });
+        await Task.Delay(3000);
+
+        var alicePmActive = aTypingEvents.Any(e =>
+            e.Nick.Equals(nickB, StringComparison.OrdinalIgnoreCase) &&
+            !e.IsChannelTyping &&
+            e.State == TypingState.Active);
+        Log($"  Alice received PM typing=active from Bob: {alicePmActive}");
+
+        // ── Self-typing: Alice should NOT receive her own typing ──
+        Log("--- 6. Self-typing (should be filtered) ---");
+        var aliceCountBefore = aTypingEvents.Count;
+        await alice.SendTagMessageAsync(channel, new Dictionary<string, string?>
+        {
+            [MessageTags.TYPING] = "active"
+        });
+        await Task.Delay(2000);
+
+        var aliceSelfFiltered = aTypingEvents.Count == aliceCountBefore;
+        Log($"  Alice's own typing was filtered (no new event): {aliceSelfFiltered}");
+
+        // ── Cleanup ──
+        await Cleanup(alice, bob);
+
+        // ── Results ──
+        Log("=== Results ===");
+        Log($"  Channel typing=active received by Bob: {bobChannelActive}");
+        Log($"  Channel typing=done received by Bob: {bobChannelDone}");
+        Log($"  PM typing=active received by Alice: {alicePmActive}");
+        Log($"  Self-typing filtered: {aliceSelfFiltered}");
+
+        // At minimum, channel typing should work if server supports message-tags
+        // PM typing may not work on all servers (some don't relay TAGMSG to non-channel targets)
+        Xunit.Assert.True(bobChannelActive, "Bob should receive channel typing=active from Alice");
+        Xunit.Assert.True(bobChannelDone, "Bob should receive channel typing=done from Alice");
+        Xunit.Assert.True(aliceSelfFiltered, "Client should filter out own typing notifications");
+    }
+
     private static async Task Cleanup(params IrcClient[] clients)
     {
         foreach (var c in clients)

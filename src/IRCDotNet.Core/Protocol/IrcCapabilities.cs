@@ -120,7 +120,7 @@ public static class MessageTags
     public const string LABEL = "label";
     /// <summary>Indicates this message is an echo of the client's own outgoing message.</summary>
     public const string ECHO = "echo-message";
-    /// <summary>Client tag indicating the user is currently typing in a conversation.</summary>
+    /// <summary>Client tag indicating typing status in a conversation. Values: <c>active</c>, <c>paused</c>, <c>done</c>.</summary>
     public const string TYPING = "+typing";
     /// <summary>Client tag referencing the <c>msgid</c> of the message being replied to.</summary>
     public const string REPLY = "+draft/reply";
@@ -128,7 +128,8 @@ public static class MessageTags
     public const string REACT = "+draft/react";
 
     /// <summary>
-    /// Prefix character for client-only tags (tags that start with <c>+</c> are not forwarded by the server).
+    /// Prefix character for client-only tags. Tags starting with <c>+</c> are set by clients
+    /// (not servers) and relayed by the server to other clients in the conversation.
     /// </summary>
     public const string CLIENT_PREFIX = "+";
 }

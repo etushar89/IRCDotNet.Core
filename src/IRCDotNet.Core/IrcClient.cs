@@ -181,6 +181,8 @@ public class IrcClient : IIrcClient
     public event EventHandler<SaslAuthenticationEvent>? SaslAuthentication;
     /// <summary>Raised when a message with IRCv3 tags is received.</summary>
     public event EventHandler<MessageTagsEvent>? MessageTagsReceived;
+    /// <summary>Raised when a <c>+typing</c> notification is received via TAGMSG (IRCv3 client tag).</summary>
+    public event EventHandler<TypingIndicatorEvent>? TypingIndicatorReceived;
 
     // RFC 1459 Events
     /// <summary>Raised when a WHO reply is received.</summary>
@@ -2468,6 +2470,32 @@ public class IrcClient : IIrcClient
         if (message.Tags.Count > 0)
         {
             ProcessMessageTags(message);
+
+            // Detect +typing client tag and fire dedicated typing indicator event
+            if (message.Tags.TryGetValue(MessageTags.TYPING, out var typingValue)
+                && !string.IsNullOrEmpty(message.Source))
+            {
+                var (nick, user, host) = ParseNickUserHost(message.Source);
+                var target = message.Parameters.Count > 0 ? message.Parameters[0] : string.Empty;
+
+                // Ignore typing notifications from ourselves
+                if (string.Equals(nick, _currentNick, StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                var state = typingValue switch
+                {
+                    "active" => TypingState.Active,
+                    "paused" => TypingState.Paused,
+                    "done" => TypingState.Done,
+                    _ => (TypingState?)null
+                };
+
+                if (state.HasValue && !string.IsNullOrEmpty(target))
+                {
+                    RaiseEventAsync(TypingIndicatorReceived,
+                        new TypingIndicatorEvent(message, nick, user, host, target, state.Value));
+                }
+            }
         }
     }
 

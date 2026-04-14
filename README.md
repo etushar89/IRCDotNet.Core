@@ -13,14 +13,14 @@ dotnet add package IRCDotNet.Core
 ## Features
 
 - **RFC 1459 + Modern IRC** — Complete protocol implementation with ISUPPORT parsing
-- **IRCv3 Capabilities** — SASL, message-tags, server-time, away-notify, account-notify, extended-join, cap-notify, chghost, batch, echo-message, monitor, setname, invite-notify, labeled-response (negotiated)
+- **IRCv3 Capabilities** — SASL, message-tags, server-time, away-notify, account-notify, extended-join, cap-notify, chghost, batch, echo-message, monitor, setname, invite-notify, labeled-response (negotiated), typing indicator via TAGMSG
 - **WebSocket Transport** — Connect via `wss://` or `ws://` endpoints (UnrealIRCd, InspIRCd, KiwiIRC gateways) alongside traditional TCP/SSL
 - **SASL Authentication** — PLAIN and EXTERNAL mechanisms with automatic CAP negotiation
 - **NickServ IDENTIFY** — Reactive identification triggered by NickServ prompts
 - **Rate Limiting** — Configurable token-bucket algorithm prevents flood protection kicks
 - **Auto-Reconnect** — Exponential backoff with automatic channel rejoin
 - **Thread-Safe** — `ConcurrentDictionary`, `ConcurrentHashSet`, semaphore-controlled sends, volatile state
-- **Event-Driven** — 39 event types with threaded, sequential, or background dispatch strategies
+- **Event-Driven** — 40 event types with threaded, sequential, or background dispatch strategies
 - **Fluent Builder** — `IrcClientOptionsBuilder` for type-safe configuration
 - **Dependency Injection** — `IServiceCollection` integration with `AddIrcClient()` and `AddIrcBotManager()`
 - **Multi-Client Management** — `IrcBotManager` as an `IHostedService` for managing multiple connections
@@ -128,7 +128,7 @@ services.AddIrcBotManager(manager =>
 | Category | Events |
 |----------|--------|
 | Connection | `Connected`, `Disconnected`, `CapabilitiesNegotiated`, `SaslAuthentication` |
-| Messages | `PrivateMessageReceived`, `NoticeReceived`, `MessageTagsReceived` |
+| Messages | `PrivateMessageReceived`, `NoticeReceived`, `MessageTagsReceived`, `TypingIndicatorReceived` |
 | Channels | `UserJoinedChannel`, `ExtendedUserJoinedChannel`, `UserLeftChannel`, `UserKicked`, `TopicChanged`, `ChannelUsersReceived`, `ChannelJoinFailed`, `ChannelModeIsReceived`, `ChannelListReceived`, `ChannelListEndReceived`, `InviteReceived` |
 | Users | `NickChanged`, `NicknameCollision`, `UserQuit`, `UserAwayStatusChanged`, `OwnAwayStatusChanged`, `UserAccountChanged`, `UserHostnameChanged` |
 | Errors | `ErrorReplyReceived` — general catch-all for any IRC error numeric (482, 442, 461, etc.) |
@@ -261,6 +261,10 @@ client.UserAccountChanged += (s, e) =>
 
 client.ExtendedUserJoinedChannel += (s, e) =>
     Console.WriteLine($"{e.Nick} joined {e.Channel} (account: {e.Account}, realname: {e.RealName})");
+
+client.TypingIndicatorReceived += (s, e) =>
+    Console.WriteLine($"{e.Nick} is {e.State} in {e.Target}");
+// State: Active, Paused, or Done — see TypingState enum
 ```
 
 ### Graceful Shutdown with Async Dispose
@@ -789,11 +793,25 @@ public class MyService(IrcClient client) { }  // also works, but not mockable
 
 ## Changelog
 
+### v2.5.0
+
+**New Features:**
+- `TypingIndicatorReceived` event — fires when a user sends a `+typing` notification via TAGMSG (IRCv3 client tag)
+- `TypingState` enum (`Active`, `Paused`, `Done`) per the IRCv3 typing specification
+- `TypingIndicatorEvent` with `Nick`, `User`, `Host`, `Target`, `State`, `IsChannelTyping`
+- Self-typing notifications are automatically filtered (client ignores its own typing TAGMSGs)
+- Added to `IIrcClient` interface (now 6 properties, 37 methods, 34 events)
+
+**Docs:**
+- Fixed `MessageTags.CLIENT_PREFIX` doc (client tags are relayed by the server, not blocked)
+- Added `<param>` tags to `TypingIndicatorEvent` constructor
+- Updated `MessageTags.TYPING` doc to list possible values
+
 ### v2.4.0
 
 **New Features:**
 - `IIrcClient` interface — enables dependency injection and unit testing with Moq/NSubstitute
-- `IrcClient` now implements `IIrcClient` (6 properties, 37 methods, 33 events)
+- `IrcClient` now implements `IIrcClient` (6 properties, 37 methods, 34 events)
 - `AddIrcClient()` DI extension registers both `IrcClient` and `IIrcClient`
 - README: Testing & Mocking section with Moq examples
 

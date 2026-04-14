@@ -221,6 +221,8 @@ public interface IIrcClient : IDisposable, IAsyncDisposable
     event EventHandler<Events.SaslAuthenticationEvent>? SaslAuthentication;
     /// <summary>Raised when a message with IRCv3 tags is received.</summary>
     event EventHandler<Events.MessageTagsEvent>? MessageTagsReceived;
+    /// <summary>Raised when a <c>+typing</c> notification is received via TAGMSG (IRCv3 client tag).</summary>
+    event EventHandler<Events.TypingIndicatorEvent>? TypingIndicatorReceived;
     /// <summary>Raised when a WHO reply is received.</summary>
     event EventHandler<Events.WhoReceivedEvent>? WhoReceived;
     /// <summary>Raised when a WHOWAS reply is received.</summary>
