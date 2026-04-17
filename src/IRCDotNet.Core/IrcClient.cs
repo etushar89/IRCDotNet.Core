@@ -48,6 +48,9 @@ public class IrcClient : IIrcClient
     // NickServ state tracking
     private volatile bool _nickServIdentified;
 
+    // MOTD accumulation buffer
+    private List<string>? _motdBuffer;
+
     // IRCv3 state tracking
     private volatile bool _saslInProgress;
     private volatile string? _currentSaslMechanism;
@@ -211,6 +214,8 @@ public class IrcClient : IIrcClient
     public event EventHandler<ChannelModeIsEvent>? ChannelModeIsReceived;
     /// <summary>Raised for general IRC error replies (482 not op, 442 not on channel, 461 need more params, etc.).</summary>
     public event EventHandler<ErrorReplyEvent>? ErrorReplyReceived;
+    /// <summary>Raised when the server's Message of the Day has been fully received (RPL_ENDOFMOTD 376).</summary>
+    public event EventHandler<MotdReceivedEvent>? MotdReceived;
 
     // Enhanced Events (PircBotX-inspired)
     /// <summary>Enhanced message event with client reference for fluent API access.</summary>
@@ -2653,16 +2658,25 @@ public class IrcClient : IIrcClient
         {
             case IrcNumericReplies.RPL_MOTDSTART:
                 _logger?.LogDebug("MOTD start received");
+                _motdBuffer = new List<string>();
                 break;
             case IrcNumericReplies.RPL_MOTD:
                 if (message.Parameters.Count > 1)
-                    _logger?.LogDebug("MOTD: {Line}", message.Parameters[1]);
+                {
+                    var line = message.Parameters[1];
+                    _logger?.LogDebug("MOTD: {Line}", line);
+                    _motdBuffer?.Add(line);
+                }
                 break;
             case IrcNumericReplies.RPL_ENDOFMOTD:
                 _logger?.LogDebug("MOTD end received");
+                var lines = _motdBuffer ?? new List<string>();
+                _motdBuffer = null;
+                RaiseEventAsync(MotdReceived, new MotdReceivedEvent(message, lines.AsReadOnly()));
                 break;
             case IrcNumericReplies.ERR_NOMOTD:
                 _logger?.LogDebug("No MOTD available");
+                _motdBuffer = null;
                 break;
         }
     }

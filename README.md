@@ -131,6 +131,7 @@ services.AddIrcBotManager(manager =>
 | Messages | `PrivateMessageReceived`, `NoticeReceived`, `MessageTagsReceived`, `TypingIndicatorReceived` |
 | Channels | `UserJoinedChannel`, `ExtendedUserJoinedChannel`, `UserLeftChannel`, `UserKicked`, `TopicChanged`, `ChannelUsersReceived`, `ChannelJoinFailed`, `ChannelModeIsReceived`, `ChannelListReceived`, `ChannelListEndReceived`, `InviteReceived` |
 | Users | `NickChanged`, `NicknameCollision`, `UserQuit`, `UserAwayStatusChanged`, `OwnAwayStatusChanged`, `UserAccountChanged`, `UserHostnameChanged` |
+| Server | `MotdReceived` |
 | Errors | `ErrorReplyReceived` — general catch-all for any IRC error numeric (482, 442, 461, etc.) |
 | Advanced | `RawMessageReceived`, `BatchReceived`, `WhoReceived`, `WhoWasReceived` |
 | CTCP | `CtcpRequestReceived`, `CtcpReplyReceived`, `CtcpActionReceived` |
@@ -792,6 +793,15 @@ public class MyService(IrcClient client) { }  // also works, but not mockable
 ```
 
 ## Changelog
+
+### v2.5.1
+
+**New Features:**
+- `MotdReceived` event — fires when the server's Message of the Day has been fully received (RPL_ENDOFMOTD 376)
+- `MotdReceivedEvent` class with `IReadOnlyList<string> Lines` property containing all MOTD lines
+- MOTD lines accumulated between RPL_MOTDSTART (375) and RPL_ENDOFMOTD (376)
+- ERR_NOMOTD (422) handled gracefully — clears buffer, no event fired
+- `IIrcClient` interface updated (now 6 properties, 37 methods, 35 events)
 
 ### v2.5.0
 

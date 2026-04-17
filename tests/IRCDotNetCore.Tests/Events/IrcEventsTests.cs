@@ -326,4 +326,57 @@ public class IrcEventsTests
         entry.UserCount.Should().Be(3);
         entry.Topic.Should().BeEmpty();
     }
+
+    [Fact]
+    public void MotdReceivedEvent_ShouldInitializeCorrectly()
+    {
+        // Arrange
+        var message = IrcMessage.Parse(":irc.test.com 376 testnick :End of MOTD command");
+        var lines = new List<string>
+        {
+            "- Welcome to the test IRC network",
+            "- Please follow our community guidelines",
+            "- Enjoy your stay!"
+        }.AsReadOnly();
+
+        // Act
+        var eventArgs = new MotdReceivedEvent(message, lines);
+
+        // Assert
+        eventArgs.Lines.Should().HaveCount(3);
+        eventArgs.Lines[0].Should().Be("- Welcome to the test IRC network");
+        eventArgs.Lines[1].Should().Be("- Please follow our community guidelines");
+        eventArgs.Lines[2].Should().Be("- Enjoy your stay!");
+        eventArgs.Message.Should().Be(message);
+        eventArgs.Timestamp.Should().BeCloseTo(DateTimeOffset.UtcNow, TimeSpan.FromSeconds(1));
+    }
+
+    [Fact]
+    public void MotdReceivedEvent_WithEmptyLines_ShouldWork()
+    {
+        // Arrange
+        var message = IrcMessage.Parse(":irc.test.com 376 testnick :End of MOTD command");
+        var lines = new List<string>().AsReadOnly();
+
+        // Act
+        var eventArgs = new MotdReceivedEvent(message, lines);
+
+        // Assert
+        eventArgs.Lines.Should().BeEmpty();
+        eventArgs.Message.Should().Be(message);
+    }
+
+    [Fact]
+    public void MotdReceivedEvent_Lines_ShouldBeReadOnly()
+    {
+        // Arrange
+        var message = IrcMessage.Parse(":irc.test.com 376 testnick :End of MOTD command");
+        var lines = new List<string> { "- Line 1" }.AsReadOnly();
+
+        // Act
+        var eventArgs = new MotdReceivedEvent(message, lines);
+
+        // Assert
+        eventArgs.Lines.Should().BeAssignableTo<IReadOnlyList<string>>();
+    }
 }

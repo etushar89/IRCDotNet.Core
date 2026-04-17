@@ -242,6 +242,56 @@ public class ComplianceIntegrationTests : IDisposable
         message.Parameters[1].Should().Be("MOTD File is missing");
     }
 
+    [Fact]
+    public void MotdReceived_Event_ShouldBeAvailableForSubscription()
+    {
+        // Arrange
+        var client = CreateTestClient();
+        MotdReceivedEvent? receivedEvent = null;
+
+        // Act & Assert - Event should be available for subscription without throwing
+        var act = () => client.MotdReceived += (sender, args) => receivedEvent = args;
+        act.Should().NotThrow();
+
+        // Verify we can also unsubscribe without issues
+        var removeAct = () => client.MotdReceived -= (sender, args) => receivedEvent = args;
+        removeAct.Should().NotThrow();
+    }
+
+    [Fact]
+    public void MotdSequence_ShouldParseAllMessages()
+    {
+        // Arrange - Simulate a complete MOTD response
+        var motdMessages = new[]
+        {
+            ":irc.test.com 375 testnick :- irc.test.com Message of the Day -",
+            ":irc.test.com 372 testnick :- Welcome to the test IRC network",
+            ":irc.test.com 372 testnick :- Please follow our community guidelines",
+            ":irc.test.com 372 testnick :- Visit https://example.com for more info",
+            ":irc.test.com 376 testnick :End of MOTD command"
+        };
+
+        // Act & Assert
+        foreach (var rawMessage in motdMessages)
+        {
+            var message = IrcMessage.Parse(rawMessage);
+            message.Should().NotBeNull();
+            message.Command.Should().BeOneOf("375", "372", "376");
+            message.Parameters[0].Should().Be("testnick");
+        }
+    }
+
+    [Fact]
+    public void MotdSequence_ShouldExtractLineText()
+    {
+        // Arrange
+        var motdLine = IrcMessage.Parse(":irc.test.com 372 testnick :- Welcome to the network");
+
+        // Act & Assert
+        motdLine.Parameters.Should().HaveCount(2);
+        motdLine.Parameters[1].Should().Be("- Welcome to the network");
+    }
+
     #endregion
 
     #region WHOIS Integration Tests

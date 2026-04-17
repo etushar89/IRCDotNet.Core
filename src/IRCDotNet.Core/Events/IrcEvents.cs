@@ -1161,3 +1161,24 @@ public class TypingIndicatorEvent : IrcEvent
         State = state;
     }
 }
+
+/// <summary>
+/// Event raised when the server's Message of the Day has been fully received (RPL_ENDOFMOTD 376).
+/// Contains all MOTD lines accumulated between RPL_MOTDSTART (375) and RPL_ENDOFMOTD (376).
+/// </summary>
+public class MotdReceivedEvent : IrcEvent
+{
+    /// <summary>The individual lines of the MOTD text.</summary>
+    public IReadOnlyList<string> Lines { get; }
+
+    /// <summary>
+    /// Initializes a new <see cref="MotdReceivedEvent"/>.
+    /// </summary>
+    /// <param name="message">The raw IRC message (RPL_ENDOFMOTD).</param>
+    /// <param name="lines">The accumulated MOTD lines.</param>
+    public MotdReceivedEvent(IrcMessage message, IReadOnlyList<string> lines)
+        : base(message)
+    {
+        Lines = lines;
+    }
+}

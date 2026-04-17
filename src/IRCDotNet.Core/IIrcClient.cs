@@ -245,4 +245,6 @@ public interface IIrcClient : IDisposable, IAsyncDisposable
     event EventHandler<Events.ChannelModeIsEvent>? ChannelModeIsReceived;
     /// <summary>Raised for general IRC error replies.</summary>
     event EventHandler<Events.ErrorReplyEvent>? ErrorReplyReceived;
+    /// <summary>Raised when the server's Message of the Day has been fully received.</summary>
+    event EventHandler<Events.MotdReceivedEvent>? MotdReceived;
 }

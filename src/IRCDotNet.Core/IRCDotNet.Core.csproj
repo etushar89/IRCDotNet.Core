@@ -8,21 +8,21 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <PackageId>IRCDotNet.Core</PackageId>
-    <Version>2.5.0</Version>
+    <Version>2.5.1</Version>
     <Authors>Tushar Sudake</Authors>
-    <Description>Modern .NET 8 IRC client library with full IRCv3 support — SASL, message tags, capabilities negotiation, CTCP (VERSION/PING/ACTION), WebSocket and TCP/SSL transports, rate limiting, auto-reconnect, typing indicator, and 40 typed events. Based on RFC 1459 and the Modern IRC Client Protocol.</Description>
+    <Description>Modern .NET 8 IRC client library with full IRCv3 support — SASL, message tags, capabilities negotiation, CTCP (VERSION/PING/ACTION), WebSocket and TCP/SSL transports, rate limiting, auto-reconnect, typing indicator, MOTD, and 41 typed events. Based on RFC 1459 and the Modern IRC Client Protocol.</Description>
     <PackageTags>irc;irc-client;ircv3;internet-relay-chat;chat;networking;sasl;protocol;real-time;async;event-driven;rate-limiting;auto-reconnect;websocket;ctcp;typing;tagmsg;dotnet;csharp</PackageTags>
     <RepositoryUrl>https://github.com/etushar89/IRCDotNet.Core</RepositoryUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <Copyright>Copyright (c) 2026 Tushar Sudake</Copyright>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageReleaseNotes>
-v2.5.0:
-- New: TypingIndicatorReceived event — IRCv3 +typing client tag via TAGMSG
-- New: TypingState enum (Active, Paused, Done) and TypingIndicatorEvent class
-- Self-typing notifications automatically filtered
-- IIrcClient interface: 6 properties, 37 methods, 34 events
-- Fixed CLIENT_PREFIX doc, added param tags to TypingIndicatorEvent
+v2.5.1:
+- New: MotdReceived event — fires when the server's Message of the Day has been fully received (RPL_ENDOFMOTD 376)
+- New: MotdReceivedEvent class with IReadOnlyList&lt;string&gt; Lines property
+- MOTD lines accumulated between RPL_MOTDSTART (375) and RPL_ENDOFMOTD (376)
+- ERR_NOMOTD (422) handled gracefully (no event fired)
+- IIrcClient interface: 6 properties, 37 methods, 35 events
 
 Full changelog: https://github.com/etushar89/IRCDotNet.Core#changelog
     </PackageReleaseNotes>

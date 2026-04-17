@@ -525,6 +525,7 @@ public class Rfc1459ComplianceTests : IDisposable
         clientType.GetEvent("WhoReceived").Should().NotBeNull();
         clientType.GetEvent("WhoWasReceived").Should().NotBeNull();
         clientType.GetEvent("ChannelListReceived").Should().NotBeNull();
+        clientType.GetEvent("MotdReceived").Should().NotBeNull();
 
         // General events
         clientType.GetEvent("RawMessageReceived").Should().NotBeNull();
