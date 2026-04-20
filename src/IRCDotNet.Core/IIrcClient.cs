@@ -138,7 +138,11 @@ public interface IIrcClient : IDisposable, IAsyncDisposable
 
     // ── IRCv3 ────────────────────────────────────────────────────────
 
-    /// <summary>Adds a nickname to the MONITOR list.</summary>
+    /// <summary>
+    /// Adds a nickname to the MONITOR list.
+    /// For PM-only contacts, any later nickname correlation is best-effort and based on monitor events plus matching user@host identity;
+    /// it is not guaranteed server truth.
+    /// </summary>
     Task MonitorNickAsync(string nick);
 
     /// <summary>Removes a nickname from the MONITOR list.</summary>

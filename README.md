@@ -282,6 +282,8 @@ client.UserQuit += (s, e) =>
 
 On servers that provide enough monitor metadata, the client can correlate monitored PM-only nickname changes and continue raising `NickChanged` and `UserQuit` for the renamed contact.
 
+This correlation is heuristic, not guaranteed server truth. The client combines monitor events with matching `user@host` identity observed within a short correlation window. That works well for common PM-only rename flows, but it can still be wrong on networks where multiple users appear with the same `user@host` identity.
+
 ### Graceful Shutdown with Async Dispose
 
 ```csharp

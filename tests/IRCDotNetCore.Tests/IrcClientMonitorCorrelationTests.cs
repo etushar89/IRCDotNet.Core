@@ -82,6 +82,30 @@ public sealed class IrcClientMonitorCorrelationTests : IDisposable
         quitEvents.Should().Contain(e => string.Equals(e.Nick, "Alice", StringComparison.OrdinalIgnoreCase));
     }
 
+    [Fact]
+    public async Task MonitorOfflineWithSingleMatchingCandidate_ShouldCorrelateUsingHeuristic()
+    {
+        var nickChanges = new List<NickChangedEvent>();
+        var quitEvents = new List<UserQuitEvent>();
+
+        _client.NickChanged += (_, e) => nickChanges.Add(e);
+        _client.UserQuit += (_, e) => quitEvents.Add(e);
+
+        await ProcessAsync($":irc.example.com {IrcNumericReplies.RPL_MONONLINE} observer :Bob!shareduser@host.test");
+        await ProcessAsync($":irc.example.com {IrcNumericReplies.RPL_MONOFFLINE} observer :Bob");
+        await ProcessAsync(":Bob2!shareduser@host.test NOTICE observer :heuristic-correlation");
+
+        await WaitUntilAsync(() => nickChanges.Count > 0, TimeSpan.FromSeconds(2));
+
+        nickChanges.Should().ContainSingle(e =>
+            string.Equals(e.OldNick, "Bob", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(e.NewNick, "Bob2", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(e.User, "shareduser", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(e.Host, "host.test", StringComparison.OrdinalIgnoreCase));
+
+        quitEvents.Should().BeEmpty();
+    }
+
     private async Task ProcessAsync(string rawMessage)
     {
         var message = IrcMessage.Parse(rawMessage);

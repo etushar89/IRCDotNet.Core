@@ -2232,6 +2232,8 @@ public class IrcClient : IIrcClient
 
     /// <summary>
     /// Adds a nickname to the server-side MONITOR list for online/offline notifications. Requires the monitor capability.
+    /// For PM-only contacts, any later nickname correlation is best-effort and based on monitor events plus matching user@host identity;
+    /// it is not guaranteed server truth.
     /// </summary>
     /// <param name="nick">Nickname to monitor.</param>
     /// <exception cref="InvalidOperationException">The monitor capability is not enabled.</exception>
