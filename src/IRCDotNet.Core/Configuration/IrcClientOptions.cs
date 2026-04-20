@@ -224,7 +224,9 @@ public class IrcClientOptions
         "message-tags",
         "batch",
         "labeled-response",
-        "echo-message"
+        "echo-message",
+        "monitor",
+        "extended-monitor"
     };
 
     /// <summary>

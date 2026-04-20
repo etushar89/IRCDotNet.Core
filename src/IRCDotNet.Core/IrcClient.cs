@@ -18,6 +18,7 @@ namespace IRCDotNet.Core;
 public class IrcClient : IIrcClient
 {
     private static readonly Regex NickUserHostRegex = new(@"^([^!]+)!([^@]+)@(.+)$", RegexOptions.Compiled);
+    private static readonly TimeSpan MonitorOfflineCorrelationWindow = TimeSpan.FromMilliseconds(750);
 
     private readonly IrcClientOptions _options;
     private readonly ILogger? _logger;
@@ -56,6 +57,7 @@ public class IrcClient : IIrcClient
     private volatile string? _currentSaslMechanism;
     private readonly ConcurrentDictionary<string, UserInfo> _userInfo = new();
     private readonly ConcurrentHashSet<string> _monitoredNicks = new();
+    private readonly ConcurrentDictionary<string, PendingMonitoredOffline> _pendingMonitoredOfflines = new(StringComparer.OrdinalIgnoreCase);
 
     // Protocol enhancements
     private readonly IrcRateLimiter _rateLimiter;
@@ -405,6 +407,18 @@ public class IrcClient : IIrcClient
             _logger?.LogWarning(ex, "Error canceling operations during disconnect");
         }
 
+        // Close the transport before awaiting the read loop so a server-side QUIT that leaves
+        // the socket open cannot deadlock client shutdown.
+        try
+        {
+            if (_transport != null)
+                await _transport.DisconnectAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning(ex, "Error disposing transport during disconnect");
+        }
+
         // Wait for read loop to complete gracefully
         try
         {
@@ -418,17 +432,6 @@ public class IrcClient : IIrcClient
         catch (Exception ex)
         {
             _logger?.LogWarning(ex, "Error waiting for read loop completion during disconnect");
-        }
-
-        // Dispose transport (handles writer, reader, stream, socket/websocket)
-        try
-        {
-            if (_transport != null)
-                await _transport.DisconnectAsync().ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogWarning(ex, "Error disposing transport during disconnect");
         }
 
         try
@@ -463,6 +466,7 @@ public class IrcClient : IIrcClient
             _enabledCapabilities.Clear();
             _supportedCapabilities.Clear();
             _monitoredNicks.Clear();
+            _pendingMonitoredOfflines.Clear();
 
             // Clear cached data
             _cachedChannels = null;
@@ -1196,6 +1200,12 @@ public class IrcClient : IIrcClient
             case IrcNumericReplies.RPL_WHOISCHANNELS:
                 HandleWhoisReply(message);
                 break;
+            case IrcNumericReplies.RPL_MONONLINE:
+                HandleMonitorOnline(message);
+                break;
+            case IrcNumericReplies.RPL_MONOFFLINE:
+                HandleMonitorOffline(message);
+                break;
 
             // Error Handling (RFC 1459 Section 6.1)
             case IrcNumericReplies.ERR_NOSUCHNICK:
@@ -1642,6 +1652,7 @@ public class IrcClient : IIrcClient
 
         // Remove from user info tracking
         _userInfo.TryRemove(nick, out _);
+        _pendingMonitoredOfflines.TryRemove(nick, out _);
 
         RaiseEventAsync(UserQuit, new UserQuitEvent(message, nick, user, host, reason));
     }
@@ -1651,6 +1662,7 @@ public class IrcClient : IIrcClient
         if (message.Parameters.Count < 2 || string.IsNullOrEmpty(message.Source)) return;
 
         var (nick, user, host) = ParseNickUserHost(message.Source);
+        TryCorrelateMonitoredNickChange(message, nick, user, host);
         var target = message.Parameters[0];
         var text = message.Parameters[1]; UpdateUserInfo(nick, user, host);
 
@@ -1689,6 +1701,7 @@ public class IrcClient : IIrcClient
         if (message.Parameters.Count < 2 || string.IsNullOrEmpty(message.Source)) return;
 
         var (nick, user, host) = ParseNickUserHost(message.Source);
+        TryCorrelateMonitoredNickChange(message, nick, user, host);
         var target = message.Parameters[0];
         var text = message.Parameters[1]; UpdateUserInfo(nick, user, host);
 
@@ -1730,37 +1743,8 @@ public class IrcClient : IIrcClient
         if (message.Parameters.Count == 0 || string.IsNullOrEmpty(message.Source)) return;
 
         var (oldNick, user, host) = ParseNickUserHost(message.Source);
-        var newNick = message.Parameters[0];
-
-        // Use state lock to prevent race conditions during nick changes
-        lock (_stateLock)
-        {
-            // If it's our nick change
-            if (oldNick == _currentNick)
-            {
-                _currentNick = newNick;
-            }
-
-            // Update in all channels atomically
-            foreach (var channel in _channels.Values)
-            {
-                if (channel.Remove(oldNick))
-                {
-                    channel.Add(newNick);
-                }
-            }
-
-            // Update user info tracking atomically
-            if (_userInfo.TryRemove(oldNick, out var userInfo))
-            {
-                userInfo.Nick = newNick;
-                _userInfo[newNick] = userInfo;
-            }
-
-            InvalidateChannelsCache();
-        }
-
-        RaiseEventAsync(NickChanged, new NickChangedEvent(message, oldNick, newNick, user, host));
+        var newNick = message.Parameters[0].TrimStart(':');
+        ApplyNickChange(message, oldNick, newNick, user, host);
     }
 
     private void HandleTopic(IrcMessage message)
@@ -2253,7 +2237,7 @@ public class IrcClient : IIrcClient
     /// <exception cref="InvalidOperationException">The monitor capability is not enabled.</exception>
     public async Task MonitorNickAsync(string nick)
     {
-        if (!_enabledCapabilities.Contains(IrcCapabilities.MONITOR))
+        if (!SupportsMonitorCapability())
         {
             throw new InvalidOperationException("monitor capability not enabled");
         }
@@ -2269,7 +2253,7 @@ public class IrcClient : IIrcClient
     /// <exception cref="InvalidOperationException">The monitor capability is not enabled.</exception>
     public async Task UnmonitorNickAsync(string nick)
     {
-        if (!_enabledCapabilities.Contains(IrcCapabilities.MONITOR))
+        if (!SupportsMonitorCapability())
         {
             throw new InvalidOperationException("monitor capability not enabled");
         }
@@ -2592,6 +2576,197 @@ public class IrcClient : IIrcClient
         }
     }
 
+    private bool SupportsMonitorCapability()
+    {
+        return _enabledCapabilities.Contains(IrcCapabilities.MONITOR)
+            || _enabledCapabilities.Contains(IrcCapabilities.EXTENDED_MONITOR);
+    }
+
+    private void HandleMonitorOnline(IrcMessage message)
+    {
+        if (message.Parameters.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var target in ParseMonitorTargets(message.Parameters[^1]))
+        {
+            if (!string.IsNullOrEmpty(target.User) || !string.IsNullOrEmpty(target.Host))
+            {
+                UpdateUserInfo(target.Nick, target.User, target.Host);
+            }
+
+            if (TryCorrelateMonitoredNickChange(message, target))
+            {
+                continue;
+            }
+
+            _pendingMonitoredOfflines.TryRemove(target.Nick, out _);
+        }
+    }
+
+    private void HandleMonitorOffline(IrcMessage message)
+    {
+        if (message.Parameters.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var target in ParseMonitorTargets(message.Parameters[^1]))
+        {
+            var pending = CreatePendingMonitoredOffline(message, target.Nick);
+            _pendingMonitoredOfflines[target.Nick] = pending;
+            SafeFireAndForget(() => FinalizePendingMonitoredOfflineAsync(pending), $"MonitorOffline_{target.Nick}");
+        }
+    }
+
+    private void ApplyNickChange(IrcMessage message, string oldNick, string newNick, string user, string host)
+    {
+        if (string.IsNullOrWhiteSpace(oldNick) || string.IsNullOrWhiteSpace(newNick))
+        {
+            return;
+        }
+
+        _pendingMonitoredOfflines.TryRemove(oldNick, out _);
+
+        var isMonitoredNick = _monitoredNicks.Contains(oldNick);
+
+        lock (_stateLock)
+        {
+            if (oldNick == _currentNick)
+            {
+                _currentNick = newNick;
+            }
+
+            foreach (var channel in _channels.Values)
+            {
+                if (channel.Remove(oldNick))
+                {
+                    channel.Add(newNick);
+                }
+            }
+
+            if (_userInfo.TryRemove(oldNick, out var userInfo))
+            {
+                userInfo.Nick = newNick;
+                if (!string.IsNullOrEmpty(user) && string.IsNullOrEmpty(userInfo.User)) userInfo.User = user;
+                if (!string.IsNullOrEmpty(host) && string.IsNullOrEmpty(userInfo.Host)) userInfo.Host = host;
+                _userInfo[newNick] = userInfo;
+            }
+            else
+            {
+                UpdateUserInfo(newNick, user, host);
+            }
+
+            InvalidateChannelsCache();
+        }
+
+        if (isMonitoredNick)
+        {
+            _monitoredNicks.Remove(oldNick);
+            _monitoredNicks.Add(newNick);
+            SafeFireAndForget(() => RefreshMonitoredNickAsync(oldNick, newNick), $"RefreshMonitor_{oldNick}_{newNick}");
+        }
+
+        RaiseEventAsync(NickChanged, new NickChangedEvent(message, oldNick, newNick, user, host));
+    }
+
+    private bool TryCorrelateMonitoredNickChange(IrcMessage message, MonitorTarget target)
+    {
+        return TryCorrelateMonitoredNickChange(message, target.Nick, target.User, target.Host);
+    }
+
+    private bool TryCorrelateMonitoredNickChange(IrcMessage message, string newNick, string user, string host)
+    {
+        if (string.IsNullOrEmpty(newNick) || string.IsNullOrEmpty(user) || string.IsNullOrEmpty(host))
+        {
+            return false;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var candidates = _pendingMonitoredOfflines.Values
+            .Where(candidate =>
+                !string.Equals(candidate.Nick, newNick, StringComparison.OrdinalIgnoreCase) &&
+                !string.IsNullOrEmpty(candidate.User) &&
+                !string.IsNullOrEmpty(candidate.Host) &&
+                string.Equals(candidate.User, user, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(candidate.Host, host, StringComparison.OrdinalIgnoreCase) &&
+                now - candidate.Timestamp <= MonitorOfflineCorrelationWindow)
+            .OrderByDescending(candidate => candidate.Timestamp)
+            .ToList();
+
+        if (candidates.Count != 1)
+        {
+            return false;
+        }
+
+        var candidate = candidates[0];
+        if (!_pendingMonitoredOfflines.TryRemove(candidate.Nick, out _))
+        {
+            return false;
+        }
+
+        ApplyNickChange(message, candidate.Nick, newNick, user, host);
+        return true;
+    }
+
+    private PendingMonitoredOffline CreatePendingMonitoredOffline(IrcMessage message, string nick)
+    {
+        if (_userInfo.TryGetValue(nick, out var userInfo))
+        {
+            lock (userInfo)
+            {
+                return new PendingMonitoredOffline(message, nick, userInfo.User, userInfo.Host, DateTimeOffset.UtcNow);
+            }
+        }
+
+        return new PendingMonitoredOffline(message, nick, string.Empty, string.Empty, DateTimeOffset.UtcNow);
+    }
+
+    private async Task FinalizePendingMonitoredOfflineAsync(PendingMonitoredOffline pending)
+    {
+        await Task.Delay(MonitorOfflineCorrelationWindow).ConfigureAwait(false);
+
+        if (!_pendingMonitoredOfflines.TryGetValue(pending.Nick, out var current) || current.Timestamp != pending.Timestamp)
+        {
+            return;
+        }
+
+        _pendingMonitoredOfflines.TryRemove(pending.Nick, out _);
+        _userInfo.TryRemove(pending.Nick, out _);
+        RaiseEventAsync(UserQuit, new UserQuitEvent(pending.Message, pending.Nick, pending.User, pending.Host));
+    }
+
+    private async Task RefreshMonitoredNickAsync(string oldNick, string newNick)
+    {
+        if (!SupportsMonitorCapability() || !_isConnected)
+        {
+            return;
+        }
+
+        try
+        {
+            await SendRawAsync($"MONITOR - {oldNick}").ConfigureAwait(false);
+            await SendRawAsync($"MONITOR + {newNick}").ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogDebug(ex, "Failed to refresh MONITOR target from {OldNick} to {NewNick}", oldNick, newNick);
+        }
+    }
+
+    private static IEnumerable<MonitorTarget> ParseMonitorTargets(string targetList)
+    {
+        foreach (var entry in targetList.TrimStart(':').Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var (nick, user, host) = ParseNickUserHost(entry);
+            if (!string.IsNullOrWhiteSpace(nick))
+            {
+                yield return new MonitorTarget(nick, user, host);
+            }
+        }
+    }
+
     /// <summary>
     /// Invalidate cached collections when data changes
     /// </summary>
@@ -2744,6 +2919,10 @@ public class IrcClient : IIrcClient
                 break;
         }
     }
+
+    private sealed record MonitorTarget(string Nick, string User, string Host);
+
+    private sealed record PendingMonitoredOffline(IrcMessage Message, string Nick, string User, string Host, DateTimeOffset Timestamp);
 
     private void HandleErrorReply(IrcMessage message)
     {

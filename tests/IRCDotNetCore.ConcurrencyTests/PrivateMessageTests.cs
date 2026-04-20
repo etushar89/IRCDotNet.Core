@@ -4,6 +4,7 @@ using System.Text;
 using IRCDotNet.Core;
 using IRCDotNet.Core.Configuration;
 using IRCDotNet.Core.Events;
+using IRCDotNet.Core.Protocol;
 using Microsoft.Extensions.Logging;
 using Xunit;
 using Xunit.Abstractions;
@@ -487,9 +488,236 @@ public class PrivateMessageTests : IDisposable
         _output.WriteLine("✅ PM stress test completed — all clients stable");
     }
 
+    /// <summary>
+    /// A monitored PM-only contact that quits should raise a quit event even without a shared channel.
+    /// </summary>
+    [Fact(Timeout = 60000)]
+    public async Task MonitoredPrivateContact_Quit_ShouldRaiseUserQuitWithoutSharedChannel()
+    {
+        var observerNick = $"MonQuitA_{DateTime.Now.Ticks % 10000}";
+        var peerNick = $"MonQuitB_{DateTime.Now.Ticks % 10000}";
+
+        var observer = await ConnectSingleUserAsync(observerNick, EnableExtendedMonitor);
+        var peer = await ConnectSingleUserAsync(peerNick, EnableExtendedMonitor);
+
+        var rawMonitorOffline = new ConcurrentBag<string>();
+        var quitEvents = new ConcurrentBag<UserQuitEvent>();
+
+        observer.RawMessageReceived += (sender, e) =>
+        {
+            if (e.Message.Command == IrcNumericReplies.RPL_MONOFFLINE)
+                rawMonitorOffline.Add(e.Message.Serialize());
+        };
+        observer.UserQuit += (sender, e) => quitEvents.Add(e);
+
+        await peer.SendMessageAsync(observerNick, "hello-before-quit");
+        await Task.Delay(1000);
+
+        Assert.Contains(IrcCapabilities.EXTENDED_MONITOR, observer.EnabledCapabilities);
+
+        await observer.MonitorNickAsync(peerNick);
+        await Task.Delay(1000);
+
+        await peer.SendRawAsync("QUIT :test quit");
+
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (!quitEvents.Any(e => string.Equals(e.Nick, peerNick, StringComparison.OrdinalIgnoreCase)) && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(200);
+        }
+
+        Assert.Contains(rawMonitorOffline, raw => raw.Contains(IrcNumericReplies.RPL_MONOFFLINE, StringComparison.OrdinalIgnoreCase) && raw.Contains(peerNick, StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(quitEvents, e => string.Equals(e.Nick, peerNick, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// A monitored PM-only contact that changes nick should raise a NickChanged event using monitor identity correlation.
+    /// </summary>
+    [Fact(Timeout = 60000)]
+    public async Task MonitoredPrivateContact_NickChange_ShouldRaiseNickChangedWithoutSharedChannel()
+    {
+        var observerNick = $"MonNickA_{DateTime.Now.Ticks % 10000}";
+        var peerNick = $"MonNickB_{DateTime.Now.Ticks % 10000}";
+        var renamedNick = $"{peerNick}x";
+
+        var observer = await ConnectSingleUserAsync(observerNick, EnableExtendedMonitor);
+        var peer = await ConnectSingleUserAsync(peerNick, EnableExtendedMonitor);
+
+        var rawMonitorOnline = new ConcurrentBag<string>();
+        var rawMonitorOffline = new ConcurrentBag<string>();
+        var rawNickChanges = new ConcurrentBag<string>();
+        var nickChangedEvents = new ConcurrentBag<NickChangedEvent>();
+        var quitEvents = new ConcurrentBag<UserQuitEvent>();
+        var renamedMessages = new ConcurrentBag<(string Nick, string Text)>();
+
+        observer.RawMessageReceived += (sender, e) =>
+        {
+            if (e.Message.Command == IrcNumericReplies.RPL_MONONLINE)
+                rawMonitorOnline.Add(e.Message.Serialize());
+            else if (e.Message.Command == IrcNumericReplies.RPL_MONOFFLINE)
+                rawMonitorOffline.Add(e.Message.Serialize());
+            else if (e.Message.Command == "NICK")
+                rawNickChanges.Add(e.Message.Serialize());
+        };
+        observer.NickChanged += (sender, e) => nickChangedEvents.Add(e);
+        observer.UserQuit += (sender, e) => quitEvents.Add(e);
+        observer.PrivateMessageReceived += (sender, e) =>
+        {
+            if (!e.IsChannelMessage)
+                renamedMessages.Add((e.Nick, e.Text));
+        };
+
+        await peer.SendMessageAsync(observerNick, "hello-before-rename");
+        await Task.Delay(1000);
+
+        Assert.Contains(IrcCapabilities.EXTENDED_MONITOR, observer.EnabledCapabilities);
+
+        await observer.MonitorNickAsync(peerNick);
+        await Task.Delay(1000);
+
+        await peer.SendRawAsync($"NICK {renamedNick}");
+        await peer.SendMessageAsync(observerNick, "hello-after-rename");
+
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (!nickChangedEvents.Any(e =>
+                   string.Equals(e.OldNick, peerNick, StringComparison.OrdinalIgnoreCase) &&
+                   string.Equals(e.NewNick, renamedNick, StringComparison.OrdinalIgnoreCase))
+               && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(200);
+        }
+
+        await Task.Delay(1000);
+
+        Assert.Contains(rawMonitorOffline, raw => raw.Contains(IrcNumericReplies.RPL_MONOFFLINE, StringComparison.OrdinalIgnoreCase) && raw.Contains(peerNick, StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(nickChangedEvents, e =>
+            string.Equals(e.OldNick, peerNick, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(e.NewNick, renamedNick, StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(quitEvents, e => string.Equals(e.Nick, peerNick, StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(renamedMessages, message =>
+            string.Equals(message.Nick, renamedNick, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(message.Text, "hello-after-rename", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// A PM-only monitored contact should surface away-notify transitions without requiring a shared channel.
+    /// </summary>
+    [Fact(Timeout = 60000)]
+    public async Task MonitoredPrivateContact_AwayStatusChanges_ShouldRaiseEventsWithoutSharedChannel()
+    {
+        var observerNick = $"MonAwayA_{DateTime.Now.Ticks % 10000}";
+        var peerNick = $"MonAwayB_{DateTime.Now.Ticks % 10000}";
+
+        var observer = await ConnectSingleUserAsync(observerNick, EnableExtendedMonitor);
+        var peer = await ConnectSingleUserAsync(peerNick, EnableExtendedMonitor);
+
+        var awayEvents = new ConcurrentBag<UserAwayStatusChangedEvent>();
+
+        observer.UserAwayStatusChanged += (sender, e) => awayEvents.Add(e);
+
+        await peer.SendMessageAsync(observerNick, "hello-before-away");
+        await Task.Delay(1000);
+
+        await observer.MonitorNickAsync(peerNick);
+        await Task.Delay(1000);
+
+        await peer.SetAwayAsync("pm-away-status");
+
+        var awayDeadline = DateTime.UtcNow.AddSeconds(10);
+        while (!awayEvents.Any(e =>
+                   string.Equals(e.Nick, peerNick, StringComparison.OrdinalIgnoreCase) &&
+                   e.IsAway &&
+                   string.Equals(e.AwayMessage, "pm-away-status", StringComparison.Ordinal))
+               && DateTime.UtcNow < awayDeadline)
+        {
+            await Task.Delay(200);
+        }
+
+        await peer.SetAwayAsync();
+
+        var backDeadline = DateTime.UtcNow.AddSeconds(10);
+        while (!awayEvents.Any(e =>
+                   string.Equals(e.Nick, peerNick, StringComparison.OrdinalIgnoreCase) &&
+                   !e.IsAway)
+               && DateTime.UtcNow < backDeadline)
+        {
+            await Task.Delay(200);
+        }
+
+        Assert.Contains(awayEvents, e =>
+            string.Equals(e.Nick, peerNick, StringComparison.OrdinalIgnoreCase) &&
+            e.IsAway &&
+            string.Equals(e.AwayMessage, "pm-away-status", StringComparison.Ordinal));
+        Assert.Contains(awayEvents, e =>
+            string.Equals(e.Nick, peerNick, StringComparison.OrdinalIgnoreCase) &&
+            !e.IsAway);
+    }
+
+    /// <summary>
+    /// After a monitored PM-only contact is correlated to a new nick, a later quit should surface under the renamed nick.
+    /// </summary>
+    [Fact(Timeout = 60000)]
+    public async Task MonitoredPrivateContact_NickChangeThenQuit_ShouldRaiseQuitForRenamedNickWithoutSharedChannel()
+    {
+        var observerNick = $"MonSeqA_{DateTime.Now.Ticks % 10000}";
+        var peerNick = $"MonSeqB_{DateTime.Now.Ticks % 10000}";
+        var renamedNick = $"{peerNick}x";
+
+        var observer = await ConnectSingleUserAsync(observerNick, EnableExtendedMonitor);
+        var peer = await ConnectSingleUserAsync(peerNick, EnableExtendedMonitor);
+
+        var nickChangedEvents = new ConcurrentBag<NickChangedEvent>();
+        var quitEvents = new ConcurrentBag<UserQuitEvent>();
+        var rawMonitorOffline = new ConcurrentBag<string>();
+
+        observer.NickChanged += (_, e) => nickChangedEvents.Add(e);
+        observer.UserQuit += (_, e) => quitEvents.Add(e);
+        observer.RawMessageReceived += (_, e) =>
+        {
+            if (e.Message.Command == IrcNumericReplies.RPL_MONOFFLINE)
+                rawMonitorOffline.Add(e.Message.Serialize());
+        };
+
+        await peer.SendMessageAsync(observerNick, "hello-before-sequence");
+        await Task.Delay(1000);
+
+        await observer.MonitorNickAsync(peerNick);
+        await Task.Delay(1000);
+
+        await peer.SendRawAsync($"NICK {renamedNick}");
+        await peer.SendMessageAsync(observerNick, "hello-after-sequence-rename");
+
+        var nickDeadline = DateTime.UtcNow.AddSeconds(10);
+        while (!nickChangedEvents.Any(e =>
+                   string.Equals(e.OldNick, peerNick, StringComparison.OrdinalIgnoreCase) &&
+                   string.Equals(e.NewNick, renamedNick, StringComparison.OrdinalIgnoreCase))
+               && DateTime.UtcNow < nickDeadline)
+        {
+            await Task.Delay(200);
+        }
+
+        await peer.SendRawAsync("QUIT :renamed quit");
+
+        var quitDeadline = DateTime.UtcNow.AddSeconds(10);
+        while (!quitEvents.Any(e => string.Equals(e.Nick, renamedNick, StringComparison.OrdinalIgnoreCase))
+               && DateTime.UtcNow < quitDeadline)
+        {
+            await Task.Delay(200);
+        }
+
+        Assert.Contains(nickChangedEvents, e =>
+            string.Equals(e.OldNick, peerNick, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(e.NewNick, renamedNick, StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(quitEvents, e => string.Equals(e.Nick, renamedNick, StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(quitEvents, e => string.Equals(e.Nick, peerNick, StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(rawMonitorOffline, raw =>
+            raw.Contains(IrcNumericReplies.RPL_MONOFFLINE, StringComparison.OrdinalIgnoreCase) &&
+            raw.Contains(renamedNick, StringComparison.OrdinalIgnoreCase));
+    }
+
     #region Helper Methods
 
-    private async Task<IrcClient> ConnectSingleUserAsync(string nick)
+    private async Task<IrcClient> ConnectSingleUserAsync(string nick, Action<IrcClientOptions>? configureOptions = null)
     {
         var options = new IrcClientOptions
         {
@@ -502,6 +730,8 @@ public class PrivateMessageTests : IDisposable
             AutoReconnect = false,
             EnableRateLimit = false
         };
+
+        configureOptions?.Invoke(options);
 
         var client = new IrcClient(options, _logger);
         _clients.Add(client);
@@ -551,6 +781,14 @@ public class PrivateMessageTests : IDisposable
         {
             // Expected for some edge cases — caller will check state
         }
+    }
+
+    private static void EnableExtendedMonitor(IrcClientOptions options)
+    {
+        if (!options.RequestedCapabilities.Contains(IrcCapabilities.MONITOR, StringComparer.OrdinalIgnoreCase))
+            options.RequestedCapabilities.Add(IrcCapabilities.MONITOR);
+        if (!options.RequestedCapabilities.Contains(IrcCapabilities.EXTENDED_MONITOR, StringComparer.OrdinalIgnoreCase))
+            options.RequestedCapabilities.Add(IrcCapabilities.EXTENDED_MONITOR);
     }
 
     public void Dispose()

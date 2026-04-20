@@ -46,6 +46,8 @@ public static class IrcCapabilities
 
     /// <summary>Track online/offline status of specific nicknames via the MONITOR command.</summary>
     public const string MONITOR = "monitor";
+    /// <summary>Extends MONITOR with metadata updates for monitored nicknames outside shared channels.</summary>
+    public const string EXTENDED_MONITOR = "extended-monitor";
     /// <summary>Change the client's real name (GECOS) without reconnecting via the SETNAME command.</summary>
     public const string SETNAME = "setname";
     /// <summary>Messages include an <c>account</c> tag with the sender's services account name.</summary>
@@ -81,6 +83,7 @@ public static class IrcCapabilities
         ECHO_MESSAGE,
         SASL,
         MONITOR,
+        EXTENDED_MONITOR,
         SETNAME,
         ACCOUNT_TAG
     };
