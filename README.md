@@ -13,7 +13,7 @@ dotnet add package IRCDotNet.Core
 ## Features
 
 - **RFC 1459 + Modern IRC** — Complete protocol implementation with ISUPPORT parsing
-- **IRCv3 Capabilities** — SASL, message-tags, server-time, away-notify, account-notify, extended-join, cap-notify, chghost, batch, echo-message, monitor, setname, invite-notify, labeled-response (negotiated), typing indicator via TAGMSG
+- **IRCv3 Capabilities** — SASL, message-tags, server-time, away-notify, account-notify, extended-join, cap-notify, chghost, batch, echo-message, monitor, extended-monitor, setname, invite-notify, labeled-response (negotiated), typing indicator via TAGMSG
 - **WebSocket Transport** — Connect via `wss://` or `ws://` endpoints (UnrealIRCd, InspIRCd, KiwiIRC gateways) alongside traditional TCP/SSL
 - **SASL Authentication** — PLAIN and EXTERNAL mechanisms with automatic CAP negotiation
 - **NickServ IDENTIFY** — Reactive identification triggered by NickServ prompts
@@ -267,6 +267,20 @@ client.TypingIndicatorReceived += (s, e) =>
     Console.WriteLine($"{e.Nick} is {e.State} in {e.Target}");
 // State: Active, Paused, or Done — see TypingState enum
 ```
+
+`monitor` and `extended-monitor` are part of the default recommended capability set. When the server negotiates them, you can explicitly monitor PM-only contacts and still receive lifecycle updates even without a shared channel:
+
+```csharp
+await client.MonitorNickAsync("SomeUser");
+
+client.NickChanged += (s, e) =>
+    Console.WriteLine($"{e.OldNick} -> {e.NewNick}");
+
+client.UserQuit += (s, e) =>
+    Console.WriteLine($"{e.Nick} quit: {e.Reason}");
+```
+
+On servers that provide enough monitor metadata, the client can correlate monitored PM-only nickname changes and continue raising `NickChanged` and `UserQuit` for the renamed contact.
 
 ### Graceful Shutdown with Async Dispose
 
@@ -793,6 +807,17 @@ public class MyService(IrcClient client) { }  // also works, but not mockable
 ```
 
 ## Changelog
+
+### Unreleased
+
+**Improvements:**
+- `extended-monitor` added to the default recommended IRCv3 capability set alongside `monitor`
+- Monitored PM-only contacts can now correlate nickname changes when the server provides enough identity data to relate the old and new nick
+- Follow-up monitor offline handling keeps `UserQuit` aligned with the renamed nick after PM-only nickname migration
+
+**Tests:**
+- Added unit coverage for monitor nickname correlation heuristics
+- Added live concurrency coverage for PM-only rename-then-quit monitor behavior
 
 ### v2.5.1
 
