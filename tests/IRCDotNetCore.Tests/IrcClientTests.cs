@@ -1,7 +1,9 @@
+using System.Reflection;
 using FluentAssertions;
 using IRCDotNet.Core;
 using IRCDotNet.Core.Configuration;
 using IRCDotNet.Core.Events;
+using IRCDotNet.Core.Protocol;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using Xunit;
@@ -192,6 +194,77 @@ public class IrcClientTests : IDisposable
         // If we got here without compilation errors, the test passes
         true.Should().BeTrue();
     }
+
+    [Fact]
+    public async Task RaiseEventAsync_WhenEarlierEventHandlerIsBlocked_ShouldNotLetLaterEventsOvertake()
+    {
+        var firstHandlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var allowFirstHandlerToContinue = new ManualResetEventSlim(false);
+        var secondHandlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var observedMessages = new List<string>();
+
+        _client.PrivateMessageReceived += (_, e) =>
+        {
+            if (string.Equals(e.Text, "first", StringComparison.Ordinal))
+            {
+                firstHandlerStarted.TrySetResult();
+                allowFirstHandlerToContinue.Wait(TimeSpan.FromSeconds(5));
+            }
+            else if (string.Equals(e.Text, "second", StringComparison.Ordinal))
+            {
+                secondHandlerStarted.TrySetResult();
+            }
+
+            lock (observedMessages)
+            {
+                observedMessages.Add(e.Text);
+            }
+        };
+
+        InvokeRaiseEventAsync(_client, "PrivateMessageReceived", CreatePrivateMessageEvent("first"));
+        await firstHandlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        InvokeRaiseEventAsync(_client, "PrivateMessageReceived", CreatePrivateMessageEvent("second"));
+        await Task.Delay(250);
+
+        secondHandlerStarted.Task.IsCompleted.Should().BeFalse();
+
+        allowFirstHandlerToContinue.Set();
+        await secondHandlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        lock (observedMessages)
+        {
+            observedMessages.Should().Equal("first", "second");
+        }
+    }
+
+    [Fact]
+    public async Task SendMessageAsync_WhenConcurrentCallsTargetSameClient_ShouldSerializeTransportWrites()
+    {
+        var transport = new BlockingTransport();
+        SetPrivateField(_client, "_transport", transport);
+        SetPrivateField(_client, "_isConnected", true);
+
+        var firstSend = _client.SendMessageAsync("user", "first");
+        await transport.FirstWriteStarted.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var secondSend = _client.SendMessageAsync("user", "second");
+        await Task.Delay(200);
+
+        transport.WriteCount.Should().Be(1);
+        transport.MaxConcurrentWrites.Should().Be(1);
+
+        transport.AllowFirstWriteToComplete();
+
+        await Task.WhenAll(firstSend, secondSend);
+
+        transport.WriteCount.Should().Be(2);
+        transport.MaxConcurrentWrites.Should().Be(1);
+        transport.WrittenLines.Should().Equal(
+            "PRIVMSG user :first",
+            "PRIVMSG user :second");
+    }
+
     [Fact]
     public void ClientProperties_ShouldBeAccessible()
     {
@@ -204,6 +277,126 @@ public class IrcClientTests : IDisposable
     public void Dispose()
     {
         _client?.Dispose();
+    }
+
+    private static void InvokeRaiseEventAsync<TEvent>(IrcClient client, string eventName, TEvent eventArgs)
+        where TEvent : IrcEvent
+    {
+        var eventField = typeof(IrcClient).GetField(eventName, BindingFlags.Instance | BindingFlags.NonPublic);
+        eventField.Should().NotBeNull();
+
+        var raiseEventMethod = typeof(IrcClient).GetMethod("RaiseEventAsync", BindingFlags.Instance | BindingFlags.NonPublic);
+        raiseEventMethod.Should().NotBeNull();
+
+        raiseEventMethod!
+            .MakeGenericMethod(typeof(TEvent))
+            .Invoke(client, [eventField!.GetValue(client), eventArgs]);
+    }
+
+    private static void SetPrivateField(IrcClient client, string fieldName, object? value)
+    {
+        var field = typeof(IrcClient).GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic);
+        field.Should().NotBeNull();
+        field!.SetValue(client, value);
+    }
+
+    private static PrivateMessageEvent CreatePrivateMessageEvent(string text)
+    {
+        return new PrivateMessageEvent(
+            new IrcMessage { Command = "PRIVMSG" },
+            "alice",
+            "user",
+            "host.test",
+            "#room",
+            text);
+    }
+
+    private sealed class BlockingTransport : IRCDotNet.Core.Transport.IIrcTransport
+    {
+        private readonly TaskCompletionSource _firstWriteStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _allowFirstWriteToComplete = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _activeWrites;
+        private int _maxConcurrentWrites;
+        private int _writeCount;
+
+        public bool IsConnected => true;
+
+        public IReadOnlyList<string> WrittenLines => _writtenLines;
+
+        public int WriteCount => Volatile.Read(ref _writeCount);
+
+        public int MaxConcurrentWrites => Volatile.Read(ref _maxConcurrentWrites);
+
+        public Task FirstWriteStarted => _firstWriteStarted.Task;
+
+        private List<string> _writtenLines { get; } = new();
+
+        public Task ConnectAsync(CancellationToken cancellationToken = default)
+        {
+            return Task.CompletedTask;
+        }
+
+        public Task<string?> ReadLineAsync(CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<string?>(null);
+        }
+
+        public async Task WriteLineAsync(string line, CancellationToken cancellationToken = default)
+        {
+            var activeWrites = Interlocked.Increment(ref _activeWrites);
+            UpdateMaxConcurrentWrites(activeWrites);
+
+            try
+            {
+                lock (_writtenLines)
+                {
+                    _writtenLines.Add(line);
+                }
+
+                var writeIndex = Interlocked.Increment(ref _writeCount);
+                if (writeIndex == 1)
+                {
+                    _firstWriteStarted.TrySetResult();
+                    await _allowFirstWriteToComplete.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _activeWrites);
+            }
+        }
+
+        public Task DisconnectAsync()
+        {
+            return Task.CompletedTask;
+        }
+
+        public void Dispose()
+        {
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            return ValueTask.CompletedTask;
+        }
+
+        public void AllowFirstWriteToComplete()
+        {
+            _allowFirstWriteToComplete.TrySetResult();
+        }
+
+        private void UpdateMaxConcurrentWrites(int activeWrites)
+        {
+            while (true)
+            {
+                var currentMax = Volatile.Read(ref _maxConcurrentWrites);
+                if (activeWrites <= currentMax)
+                    return;
+
+                if (Interlocked.CompareExchange(ref _maxConcurrentWrites, activeWrites, currentMax) == currentMax)
+                    return;
+            }
+        }
     }
 }
 

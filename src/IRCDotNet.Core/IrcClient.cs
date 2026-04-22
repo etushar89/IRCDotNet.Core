@@ -23,9 +23,11 @@ public class IrcClient : IIrcClient
     private readonly IrcClientOptions _options;
     private readonly ILogger? _logger;
     private readonly object _stateLock = new();
-    private readonly SemaphoreSlim _sendLock = new(5, 5); // Allow up to 5 concurrent sends
+    private readonly SemaphoreSlim _sendLock = new(1, 1); // IRC transports require ordered, non-overlapping writes per connection
     private readonly SemaphoreSlim _connectLock = new(1, 1);
+    private readonly ConcurrentQueue<Func<Task>> _pendingEventDispatches = new();
     private volatile int _disposed = 0; // Use Interlocked for thread-safety
+    private volatile int _isProcessingEventQueue;
 
     // Cached collections to prevent excessive allocations
     private IReadOnlyDictionary<string, IReadOnlySet<string>>? _cachedChannels;
@@ -1662,7 +1664,6 @@ public class IrcClient : IIrcClient
         if (message.Parameters.Count < 2 || string.IsNullOrEmpty(message.Source)) return;
 
         var (nick, user, host) = ParseNickUserHost(message.Source);
-        TryCorrelateMonitoredNickChange(message, nick, user, host);
         var target = message.Parameters[0];
         var text = message.Parameters[1]; UpdateUserInfo(nick, user, host);
 
@@ -1701,7 +1702,6 @@ public class IrcClient : IIrcClient
         if (message.Parameters.Count < 2 || string.IsNullOrEmpty(message.Source)) return;
 
         var (nick, user, host) = ParseNickUserHost(message.Source);
-        TryCorrelateMonitoredNickChange(message, nick, user, host);
         var target = message.Parameters[0];
         var text = message.Parameters[1]; UpdateUserInfo(nick, user, host);
 
@@ -2232,8 +2232,7 @@ public class IrcClient : IIrcClient
 
     /// <summary>
     /// Adds a nickname to the server-side MONITOR list for online/offline notifications. Requires the monitor capability.
-    /// For PM-only contacts, any later nickname correlation is best-effort and based on monitor events plus matching user@host identity;
-    /// it is not guaranteed server truth.
+    /// MONITOR does not infer nickname changes; <see cref="NickChanged"/> is raised only when the server sends an explicit rename signal.
     /// </summary>
     /// <param name="nick">Nickname to monitor.</param>
     /// <exception cref="InvalidOperationException">The monitor capability is not enabled.</exception>
@@ -2352,15 +2351,15 @@ public class IrcClient : IIrcClient
     /// </summary>
     private void RaiseEventAsync<T>(EventHandler<T>? eventHandler, T eventArgs) where T : IrcEvent
     {
-        if (eventHandler == null) return;
+        if (eventHandler == null || _disposed == 1)
+            return;
 
-        // Fire events asynchronously to prevent blocking the read loop
-        SafeFireAndForget(() =>
+        var handlers = eventHandler.GetInvocationList().Cast<EventHandler<T>>().ToArray();
+        if (handlers.Length == 0)
+            return;
+
+        _pendingEventDispatches.Enqueue(() =>
         {
-            // Take a snapshot of the invocation list to prevent race conditions
-            var handlers = eventHandler.GetInvocationList().Cast<EventHandler<T>>().ToArray();
-
-            // Invoke each handler individually to ensure exceptions in one handler don't stop others
             foreach (var handler in handlers)
             {
                 try
@@ -2372,8 +2371,49 @@ public class IrcClient : IIrcClient
                     _logger?.LogError(ex, "Error in event handler for {EventType}", typeof(T).Name);
                 }
             }
+
             return Task.CompletedTask;
-        }, $"EventHandler_{typeof(T).Name}");
+        });
+
+        StartPendingEventDispatchProcessing();
+    }
+
+    private void StartPendingEventDispatchProcessing()
+    {
+        if (Interlocked.CompareExchange(ref _isProcessingEventQueue, 1, 0) != 0)
+            return;
+
+        SafeFireAndForget(ProcessPendingEventDispatchesAsync, "ProcessPendingEventDispatches");
+    }
+
+    private async Task ProcessPendingEventDispatchesAsync()
+    {
+        try
+        {
+            while (true)
+            {
+                while (_pendingEventDispatches.TryDequeue(out var dispatch))
+                {
+                    if (_disposed == 1)
+                        return;
+
+                    await dispatch().ConfigureAwait(false);
+                }
+
+                Interlocked.Exchange(ref _isProcessingEventQueue, 0);
+
+                if (_pendingEventDispatches.IsEmpty || Interlocked.CompareExchange(ref _isProcessingEventQueue, 1, 0) != 0)
+                    return;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Unhandled exception while processing queued IRC events.");
+            Interlocked.Exchange(ref _isProcessingEventQueue, 0);
+
+            if (!_pendingEventDispatches.IsEmpty)
+                StartPendingEventDispatchProcessing();
+        }
     }
 
     /// <summary>
@@ -2598,11 +2638,6 @@ public class IrcClient : IIrcClient
                 UpdateUserInfo(target.Nick, target.User, target.Host);
             }
 
-            if (TryCorrelateMonitoredNickChange(message, target))
-            {
-                continue;
-            }
-
             _pendingMonitoredOfflines.TryRemove(target.Nick, out _);
         }
     }
@@ -2671,45 +2706,6 @@ public class IrcClient : IIrcClient
         }
 
         RaiseEventAsync(NickChanged, new NickChangedEvent(message, oldNick, newNick, user, host));
-    }
-
-    private bool TryCorrelateMonitoredNickChange(IrcMessage message, MonitorTarget target)
-    {
-        return TryCorrelateMonitoredNickChange(message, target.Nick, target.User, target.Host);
-    }
-
-    private bool TryCorrelateMonitoredNickChange(IrcMessage message, string newNick, string user, string host)
-    {
-        if (string.IsNullOrEmpty(newNick) || string.IsNullOrEmpty(user) || string.IsNullOrEmpty(host))
-        {
-            return false;
-        }
-
-        var now = DateTimeOffset.UtcNow;
-        var candidates = _pendingMonitoredOfflines.Values
-            .Where(candidate =>
-                !string.Equals(candidate.Nick, newNick, StringComparison.OrdinalIgnoreCase) &&
-                !string.IsNullOrEmpty(candidate.User) &&
-                !string.IsNullOrEmpty(candidate.Host) &&
-                string.Equals(candidate.User, user, StringComparison.OrdinalIgnoreCase) &&
-                string.Equals(candidate.Host, host, StringComparison.OrdinalIgnoreCase) &&
-                now - candidate.Timestamp <= MonitorOfflineCorrelationWindow)
-            .OrderByDescending(candidate => candidate.Timestamp)
-            .ToList();
-
-        if (candidates.Count != 1)
-        {
-            return false;
-        }
-
-        var candidate = candidates[0];
-        if (!_pendingMonitoredOfflines.TryRemove(candidate.Nick, out _))
-        {
-            return false;
-        }
-
-        ApplyNickChange(message, candidate.Nick, newNick, user, host);
-        return true;
     }
 
     private PendingMonitoredOffline CreatePendingMonitoredOffline(IrcMessage message, string nick)

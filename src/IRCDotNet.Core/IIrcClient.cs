@@ -140,8 +140,7 @@ public interface IIrcClient : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// Adds a nickname to the MONITOR list.
-    /// For PM-only contacts, any later nickname correlation is best-effort and based on monitor events plus matching user@host identity;
-    /// it is not guaranteed server truth.
+    /// MONITOR does not infer nickname changes; <see cref="Events.NickChangedEvent"/> is raised only when the server sends an explicit rename signal.
     /// </summary>
     Task MonitorNickAsync(string nick);
 

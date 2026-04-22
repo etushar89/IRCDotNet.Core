@@ -8,12 +8,12 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace IRCDotNet.Tests;
 
-public sealed class IrcClientMonitorCorrelationTests : IDisposable
+public sealed class IrcClientMonitorLifecycleTests : IDisposable
 {
     private readonly IrcClient _client;
     private readonly MethodInfo _processMessageAsync;
 
-    public IrcClientMonitorCorrelationTests()
+    public IrcClientMonitorLifecycleTests()
     {
         _client = new IrcClient(
             new IrcClientOptions
@@ -31,7 +31,7 @@ public sealed class IrcClientMonitorCorrelationTests : IDisposable
     }
 
     [Fact]
-    public async Task MonitorOfflineFollowedByPrivateMessageWithMatchingUserHost_ShouldRaiseNickChanged()
+    public async Task MonitorOfflineFollowedByPrivateMessageWithMatchingUserHost_ShouldNotGuessNickChanged()
     {
         var nickChanges = new List<NickChangedEvent>();
         var quitEvents = new List<UserQuitEvent>();
@@ -45,15 +45,11 @@ public sealed class IrcClientMonitorCorrelationTests : IDisposable
         await ProcessAsync($":irc.example.com {IrcNumericReplies.RPL_MONOFFLINE} observer :Bob");
         await ProcessAsync(":Bob2!shareduser@host.test PRIVMSG observer :hello-after-rename");
 
-        await WaitUntilAsync(() => nickChanges.Count > 0 && privateMessages.Count > 0, TimeSpan.FromSeconds(2));
+        await WaitUntilAsync(() => quitEvents.Count > 0 && privateMessages.Count > 0, TimeSpan.FromSeconds(3));
 
-        nickChanges.Should().ContainSingle(e =>
-            string.Equals(e.OldNick, "Bob", StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(e.NewNick, "Bob2", StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(e.User, "shareduser", StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(e.Host, "host.test", StringComparison.OrdinalIgnoreCase));
-
-        quitEvents.Should().BeEmpty();
+        nickChanges.Should().BeEmpty();
+        quitEvents.Should().ContainSingle(e =>
+            string.Equals(e.Nick, "Bob", StringComparison.OrdinalIgnoreCase));
         privateMessages.Should().ContainSingle(e =>
             string.Equals(e.Nick, "Bob2", StringComparison.OrdinalIgnoreCase) &&
             string.Equals(e.Text, "hello-after-rename", StringComparison.Ordinal));
@@ -83,7 +79,7 @@ public sealed class IrcClientMonitorCorrelationTests : IDisposable
     }
 
     [Fact]
-    public async Task MonitorOfflineWithSingleMatchingCandidate_ShouldCorrelateUsingHeuristic()
+    public async Task MonitorOfflineWithSingleMatchingCandidate_ShouldNotGuessNickChange()
     {
         var nickChanges = new List<NickChangedEvent>();
         var quitEvents = new List<UserQuitEvent>();
@@ -93,17 +89,13 @@ public sealed class IrcClientMonitorCorrelationTests : IDisposable
 
         await ProcessAsync($":irc.example.com {IrcNumericReplies.RPL_MONONLINE} observer :Bob!shareduser@host.test");
         await ProcessAsync($":irc.example.com {IrcNumericReplies.RPL_MONOFFLINE} observer :Bob");
-        await ProcessAsync(":Bob2!shareduser@host.test NOTICE observer :heuristic-correlation");
+        await ProcessAsync(":Bob2!shareduser@host.test NOTICE observer :no-guess-notice");
 
-        await WaitUntilAsync(() => nickChanges.Count > 0, TimeSpan.FromSeconds(2));
+        await WaitUntilAsync(() => quitEvents.Count > 0, TimeSpan.FromSeconds(3));
 
-        nickChanges.Should().ContainSingle(e =>
-            string.Equals(e.OldNick, "Bob", StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(e.NewNick, "Bob2", StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(e.User, "shareduser", StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(e.Host, "host.test", StringComparison.OrdinalIgnoreCase));
-
-        quitEvents.Should().BeEmpty();
+        nickChanges.Should().BeEmpty();
+        quitEvents.Should().ContainSingle(e =>
+            string.Equals(e.Nick, "Bob", StringComparison.OrdinalIgnoreCase));
     }
 
     private async Task ProcessAsync(string rawMessage)

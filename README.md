@@ -280,9 +280,7 @@ client.UserQuit += (s, e) =>
     Console.WriteLine($"{e.Nick} quit: {e.Reason}");
 ```
 
-On servers that provide enough monitor metadata, the client can correlate monitored PM-only nickname changes and continue raising `NickChanged` and `UserQuit` for the renamed contact.
-
-This correlation is heuristic, not guaranteed server truth. The client combines monitor events with matching `user@host` identity observed within a short correlation window. That works well for common PM-only rename flows, but it can still be wrong on networks where multiple users appear with the same `user@host` identity.
+`MONITOR` does not infer nickname changes from later PMs, notices, or matching `user@host` identity. `NickChanged` is raised only when the server sends an explicit `NICK` event the client can observe. Otherwise, PM-only monitor tracking stays attached to the monitored nickname and `UserQuit` remains scoped to that nickname.
 
 ### Graceful Shutdown with Async Dispose
 
@@ -814,12 +812,12 @@ public class MyService(IrcClient client) { }  // also works, but not mockable
 
 **Improvements:**
 - `extended-monitor` added to the default recommended IRCv3 capability set alongside `monitor`
-- Monitored PM-only contacts can now correlate nickname changes when the server provides enough identity data to relate the old and new nick
-- Follow-up monitor offline handling keeps `UserQuit` aligned with the renamed nick after PM-only nickname migration
+- Monitored PM-only contacts no longer infer nickname changes from monitor activity plus matching `user@host` identity
+- PM-only monitor tracking moves to a renamed nick only when the server exposes an explicit `NICK` event
 
 **Tests:**
-- Added unit coverage for monitor nickname correlation heuristics
-- Added live concurrency coverage for PM-only rename-then-quit monitor behavior
+- Updated unit coverage to enforce explicit-only monitor nickname handling
+- Updated live concurrency coverage to require explicit rename signals before transferring monitor state
 
 ### v2.5.1
 

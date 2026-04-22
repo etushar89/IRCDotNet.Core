@@ -531,10 +531,10 @@ public class PrivateMessageTests : IDisposable
     }
 
     /// <summary>
-    /// A monitored PM-only contact that changes nick should raise a NickChanged event using monitor identity correlation.
+    /// A monitored PM-only contact should only raise NickChanged when the server exposes an explicit NICK signal.
     /// </summary>
     [Fact(Timeout = 60000)]
-    public async Task MonitoredPrivateContact_NickChange_ShouldRaiseNickChangedWithoutSharedChannel()
+    public async Task MonitoredPrivateContact_NickChange_ShouldOnlyRaiseNickChangedWhenExplicitNickSignalIsObserved()
     {
         var observerNick = $"MonNickA_{DateTime.Now.Ticks % 10000}";
         var peerNick = $"MonNickB_{DateTime.Now.Ticks % 10000}";
@@ -579,24 +579,44 @@ public class PrivateMessageTests : IDisposable
         await peer.SendMessageAsync(observerNick, "hello-after-rename");
 
         var deadline = DateTime.UtcNow.AddSeconds(10);
-        while (!nickChangedEvents.Any(e =>
-                   string.Equals(e.OldNick, peerNick, StringComparison.OrdinalIgnoreCase) &&
-                   string.Equals(e.NewNick, renamedNick, StringComparison.OrdinalIgnoreCase))
-               && DateTime.UtcNow < deadline)
+        while (DateTime.UtcNow < deadline)
         {
+            var sawRenamedMessage = renamedMessages.Any(message =>
+                string.Equals(message.Nick, renamedNick, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(message.Text, "hello-after-rename", StringComparison.Ordinal));
+            var sawExplicitRename = nickChangedEvents.Any(e =>
+                string.Equals(e.OldNick, peerNick, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(e.NewNick, renamedNick, StringComparison.OrdinalIgnoreCase));
+            var sawOldQuit = quitEvents.Any(e => string.Equals(e.Nick, peerNick, StringComparison.OrdinalIgnoreCase));
+
+            if (sawRenamedMessage && (sawExplicitRename || sawOldQuit))
+            {
+                break;
+            }
+
             await Task.Delay(200);
         }
 
         await Task.Delay(1000);
 
         Assert.Contains(rawMonitorOffline, raw => raw.Contains(IrcNumericReplies.RPL_MONOFFLINE, StringComparison.OrdinalIgnoreCase) && raw.Contains(peerNick, StringComparison.OrdinalIgnoreCase));
-        Assert.Contains(nickChangedEvents, e =>
-            string.Equals(e.OldNick, peerNick, StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(e.NewNick, renamedNick, StringComparison.OrdinalIgnoreCase));
-        Assert.DoesNotContain(quitEvents, e => string.Equals(e.Nick, peerNick, StringComparison.OrdinalIgnoreCase));
         Assert.Contains(renamedMessages, message =>
             string.Equals(message.Nick, renamedNick, StringComparison.OrdinalIgnoreCase) &&
             string.Equals(message.Text, "hello-after-rename", StringComparison.Ordinal));
+
+        if (nickChangedEvents.Any(e =>
+                string.Equals(e.OldNick, peerNick, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(e.NewNick, renamedNick, StringComparison.OrdinalIgnoreCase)))
+        {
+            Assert.Contains(rawNickChanges, raw =>
+                raw.Contains("NICK", StringComparison.OrdinalIgnoreCase) &&
+                raw.Contains(peerNick, StringComparison.OrdinalIgnoreCase) &&
+                raw.Contains(renamedNick, StringComparison.OrdinalIgnoreCase));
+        }
+        else
+        {
+            Assert.Contains(quitEvents, e => string.Equals(e.Nick, peerNick, StringComparison.OrdinalIgnoreCase));
+        }
     }
 
     /// <summary>
@@ -654,10 +674,10 @@ public class PrivateMessageTests : IDisposable
     }
 
     /// <summary>
-    /// After a monitored PM-only contact is correlated to a new nick, a later quit should surface under the renamed nick.
+    /// A monitored PM-only contact should only transfer quit tracking to the renamed nick when an explicit NICK signal is observed.
     /// </summary>
     [Fact(Timeout = 60000)]
-    public async Task MonitoredPrivateContact_NickChangeThenQuit_ShouldRaiseQuitForRenamedNickWithoutSharedChannel()
+    public async Task MonitoredPrivateContact_NickChangeThenQuit_ShouldRequireExplicitNickSignalToTrackRenamedNick()
     {
         var observerNick = $"MonSeqA_{DateTime.Now.Ticks % 10000}";
         var peerNick = $"MonSeqB_{DateTime.Now.Ticks % 10000}";
@@ -669,6 +689,7 @@ public class PrivateMessageTests : IDisposable
         var nickChangedEvents = new ConcurrentBag<NickChangedEvent>();
         var quitEvents = new ConcurrentBag<UserQuitEvent>();
         var rawMonitorOffline = new ConcurrentBag<string>();
+        var rawNickChanges = new ConcurrentBag<string>();
 
         observer.NickChanged += (_, e) => nickChangedEvents.Add(e);
         observer.UserQuit += (_, e) => quitEvents.Add(e);
@@ -676,6 +697,8 @@ public class PrivateMessageTests : IDisposable
         {
             if (e.Message.Command == IrcNumericReplies.RPL_MONOFFLINE)
                 rawMonitorOffline.Add(e.Message.Serialize());
+            else if (e.Message.Command == "NICK")
+                rawNickChanges.Add(e.Message.Serialize());
         };
 
         await peer.SendMessageAsync(observerNick, "hello-before-sequence");
@@ -688,7 +711,8 @@ public class PrivateMessageTests : IDisposable
         await peer.SendMessageAsync(observerNick, "hello-after-sequence-rename");
 
         var nickDeadline = DateTime.UtcNow.AddSeconds(10);
-        while (!nickChangedEvents.Any(e =>
+        while (!quitEvents.Any(e => string.Equals(e.Nick, peerNick, StringComparison.OrdinalIgnoreCase))
+               && !nickChangedEvents.Any(e =>
                    string.Equals(e.OldNick, peerNick, StringComparison.OrdinalIgnoreCase) &&
                    string.Equals(e.NewNick, renamedNick, StringComparison.OrdinalIgnoreCase))
                && DateTime.UtcNow < nickDeadline)
@@ -696,23 +720,49 @@ public class PrivateMessageTests : IDisposable
             await Task.Delay(200);
         }
 
+        var sawExplicitRename = nickChangedEvents.Any(e =>
+            string.Equals(e.OldNick, peerNick, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(e.NewNick, renamedNick, StringComparison.OrdinalIgnoreCase));
+
         await peer.SendRawAsync("QUIT :renamed quit");
 
         var quitDeadline = DateTime.UtcNow.AddSeconds(10);
-        while (!quitEvents.Any(e => string.Equals(e.Nick, renamedNick, StringComparison.OrdinalIgnoreCase))
-               && DateTime.UtcNow < quitDeadline)
+        while (DateTime.UtcNow < quitDeadline)
         {
+            var sawOldQuit = quitEvents.Any(e => string.Equals(e.Nick, peerNick, StringComparison.OrdinalIgnoreCase));
+            var sawRenamedQuit = quitEvents.Any(e => string.Equals(e.Nick, renamedNick, StringComparison.OrdinalIgnoreCase));
+
+            if (sawExplicitRename ? sawRenamedQuit : sawOldQuit)
+            {
+                break;
+            }
+
             await Task.Delay(200);
         }
 
-        Assert.Contains(nickChangedEvents, e =>
-            string.Equals(e.OldNick, peerNick, StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(e.NewNick, renamedNick, StringComparison.OrdinalIgnoreCase));
-        Assert.Contains(quitEvents, e => string.Equals(e.Nick, renamedNick, StringComparison.OrdinalIgnoreCase));
-        Assert.DoesNotContain(quitEvents, e => string.Equals(e.Nick, peerNick, StringComparison.OrdinalIgnoreCase));
-        Assert.Contains(rawMonitorOffline, raw =>
-            raw.Contains(IrcNumericReplies.RPL_MONOFFLINE, StringComparison.OrdinalIgnoreCase) &&
-            raw.Contains(renamedNick, StringComparison.OrdinalIgnoreCase));
+        if (sawExplicitRename)
+        {
+            Assert.Contains(rawNickChanges, raw =>
+                raw.Contains("NICK", StringComparison.OrdinalIgnoreCase) &&
+                raw.Contains(peerNick, StringComparison.OrdinalIgnoreCase) &&
+                raw.Contains(renamedNick, StringComparison.OrdinalIgnoreCase));
+            Assert.Contains(quitEvents, e => string.Equals(e.Nick, renamedNick, StringComparison.OrdinalIgnoreCase));
+            Assert.DoesNotContain(quitEvents, e => string.Equals(e.Nick, peerNick, StringComparison.OrdinalIgnoreCase));
+            Assert.Contains(rawMonitorOffline, raw =>
+                raw.Contains(IrcNumericReplies.RPL_MONOFFLINE, StringComparison.OrdinalIgnoreCase) &&
+                raw.Contains(renamedNick, StringComparison.OrdinalIgnoreCase));
+        }
+        else
+        {
+            Assert.DoesNotContain(nickChangedEvents, e =>
+                string.Equals(e.OldNick, peerNick, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(e.NewNick, renamedNick, StringComparison.OrdinalIgnoreCase));
+            Assert.Contains(quitEvents, e => string.Equals(e.Nick, peerNick, StringComparison.OrdinalIgnoreCase));
+            Assert.DoesNotContain(quitEvents, e => string.Equals(e.Nick, renamedNick, StringComparison.OrdinalIgnoreCase));
+            Assert.Contains(rawMonitorOffline, raw =>
+                raw.Contains(IrcNumericReplies.RPL_MONOFFLINE, StringComparison.OrdinalIgnoreCase) &&
+                raw.Contains(peerNick, StringComparison.OrdinalIgnoreCase));
+        }
     }
 
     #region Helper Methods
