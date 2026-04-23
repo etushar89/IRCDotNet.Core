@@ -266,6 +266,60 @@ public class IrcClientTests : IDisposable
     }
 
     [Fact]
+    public async Task DisposeAsync_WhenEventsAreAlreadyQueued_ShouldDrainQueueAndRaiseDisconnected()
+    {
+        var firstHandlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondHandlerCompleted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var disconnectedReceived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var allowFirstHandlerToContinue = new ManualResetEventSlim(false);
+        var observedMessages = new List<string>();
+
+        SetPrivateField(_client, "_transport", new BlockingTransport());
+        SetPrivateField(_client, "_isConnected", true);
+
+        _client.PrivateMessageReceived += (_, e) =>
+        {
+            if (string.Equals(e.Text, "first", StringComparison.Ordinal))
+            {
+                firstHandlerStarted.TrySetResult();
+                allowFirstHandlerToContinue.Wait(TimeSpan.FromSeconds(5));
+            }
+
+            lock (observedMessages)
+            {
+                observedMessages.Add(e.Text);
+            }
+
+            if (string.Equals(e.Text, "second", StringComparison.Ordinal))
+                secondHandlerCompleted.TrySetResult();
+        };
+
+        _client.Disconnected += (_, _) => disconnectedReceived.TrySetResult();
+
+        InvokeRaiseEventAsync(_client, "PrivateMessageReceived", CreatePrivateMessageEvent("first"));
+        await firstHandlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        InvokeRaiseEventAsync(_client, "PrivateMessageReceived", CreatePrivateMessageEvent("second"));
+
+        var disposeTask = _client.DisposeAsync().AsTask();
+
+        await Task.Delay(250);
+        secondHandlerCompleted.Task.IsCompleted.Should().BeFalse();
+        disconnectedReceived.Task.IsCompleted.Should().BeFalse();
+
+        allowFirstHandlerToContinue.Set();
+
+        await disposeTask.WaitAsync(TimeSpan.FromSeconds(5));
+        await secondHandlerCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await disconnectedReceived.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        lock (observedMessages)
+        {
+            observedMessages.Should().Equal("first", "second");
+        }
+    }
+
+    [Fact]
     public void ClientProperties_ShouldBeAccessible()
     {
         // Assert - These should compile without error

@@ -26,6 +26,8 @@ public class IrcClient : IIrcClient
     private readonly SemaphoreSlim _sendLock = new(1, 1); // IRC transports require ordered, non-overlapping writes per connection
     private readonly SemaphoreSlim _connectLock = new(1, 1);
     private readonly ConcurrentQueue<Func<Task>> _pendingEventDispatches = new();
+    private volatile int _disposeRequested = 0; // Prevent concurrent dispose entry while still allowing final queued events to drain
+    private volatile int _eventDispatchClosed = 0;
     private volatile int _disposed = 0; // Use Interlocked for thread-safety
     private volatile int _isProcessingEventQueue;
 
@@ -2280,10 +2282,13 @@ public class IrcClient : IIrcClient
     /// <inheritdoc />
     public void Dispose()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) == 1) return; // Thread-safe disposal check
+        if (Interlocked.Exchange(ref _disposeRequested, 1) == 1) return;
 
         try
         {
+            Interlocked.Exchange(ref _eventDispatchClosed, 1);
+            Interlocked.Exchange(ref _disposed, 1);
+
             // Don't block - just signal cancellation and cleanup synchronously
             _cancellationTokenSource?.Cancel();
 
@@ -2323,7 +2328,7 @@ public class IrcClient : IIrcClient
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) == 1) return; // Thread-safe disposal check
+        if (Interlocked.Exchange(ref _disposeRequested, 1) == 1) return;
 
         try
         {
@@ -2335,6 +2340,8 @@ public class IrcClient : IIrcClient
         }
         finally
         {
+            Interlocked.Exchange(ref _eventDispatchClosed, 1);
+            Interlocked.Exchange(ref _disposed, 1);
             _sendLock?.Dispose();
             _connectLock?.Dispose();
             GC.SuppressFinalize(this);
@@ -2351,7 +2358,7 @@ public class IrcClient : IIrcClient
     /// </summary>
     private void RaiseEventAsync<T>(EventHandler<T>? eventHandler, T eventArgs) where T : IrcEvent
     {
-        if (eventHandler == null || _disposed == 1)
+        if (eventHandler == null || _eventDispatchClosed == 1)
             return;
 
         var handlers = eventHandler.GetInvocationList().Cast<EventHandler<T>>().ToArray();
@@ -2394,9 +2401,6 @@ public class IrcClient : IIrcClient
             {
                 while (_pendingEventDispatches.TryDequeue(out var dispatch))
                 {
-                    if (_disposed == 1)
-                        return;
-
                     await dispatch().ConfigureAwait(false);
                 }
 
