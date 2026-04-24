@@ -45,7 +45,9 @@ public class IrcClient : IIrcClient
     private volatile bool _isRegistered;
     private volatile string _currentNick = string.Empty;
     private readonly ConcurrentHashSet<string> _supportedCapabilities = new();
-    private readonly ConcurrentHashSet<string> _enabledCapabilities = new(); private readonly ConcurrentDictionary<string, ConcurrentHashSet<string>> _channels = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentHashSet<string> _enabledCapabilities = new();
+    private readonly ConcurrentDictionary<string, ConcurrentHashSet<string>> _channels = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, PendingNamesState> _pendingNamesUsers = new(StringComparer.OrdinalIgnoreCase);
     private DateTimeOffset _lastPongReceived = DateTimeOffset.UtcNow;
     private volatile int _reconnectAttempts;
     private volatile List<string> _channelsToRejoin = new();
@@ -466,6 +468,7 @@ public class IrcClient : IIrcClient
 
             // Clear all collections and state
             _channels.Clear();
+            _pendingNamesUsers.Clear();
             _userInfo.Clear();
             _enabledCapabilities.Clear();
             _supportedCapabilities.Clear();
@@ -1011,18 +1014,29 @@ public class IrcClient : IIrcClient
 
         if (_isConnected)
         {
-            // Save channels to rejoin after reconnection
-            _channelsToRejoin = _channels.Keys.ToList();
-
-            await DisconnectInternalAsync("Connection lost").ConfigureAwait(false);
-
-            // Auto-reconnect if enabled
-            if (_options.AutoReconnect)
-            {
-                SafeFireAndForget(() => AttemptReconnectAsync(), "AutoReconnect");
-            }
+            await HandleUnexpectedDisconnectAsync("Connection lost").ConfigureAwait(false);
         }
     }
+
+    private async Task HandleUnexpectedDisconnectAsync(string reason)
+    {
+        if (_options.AutoReconnect)
+        {
+            _channelsToRejoin = _channels.Keys.ToList();
+        }
+        else
+        {
+            _channelsToRejoin = new();
+        }
+
+        await DisconnectInternalAsync(reason).ConfigureAwait(false);
+
+        if (_options.AutoReconnect)
+        {
+            SafeFireAndForget(() => AttemptReconnectAsync(), "AutoReconnect");
+        }
+    }
+
     private async Task ProcessMessageAsync(IrcMessage message)
     {
         // Process message tags for IRCv3 features
@@ -1602,10 +1616,15 @@ public class IrcClient : IIrcClient
             _channels[channel] = new ConcurrentHashSet<string>();
             InvalidateChannelsCache();
         }
-        else if (_channels.ContainsKey(channel))
+        else
         {
-            _channels[channel].Add(nick);
-            InvalidateChannelsCache();
+            if (_channels.ContainsKey(channel))
+            {
+                _channels[channel].Add(nick);
+                InvalidateChannelsCache();
+            }
+
+            QueuePendingNamesAdd(channel, nick);
         }        // Raise appropriate events
         if (_enabledCapabilities.Contains(IrcCapabilities.EXTENDED_JOIN) && (account != null || realName != null))
         {
@@ -1629,12 +1648,18 @@ public class IrcClient : IIrcClient
         if (nick == _currentNick)
         {
             _channels.TryRemove(channel, out _);
+            _pendingNamesUsers.TryRemove(channel, out _);
             InvalidateChannelsCache();
         }
-        else if (_channels.ContainsKey(channel))
+        else
         {
-            _channels[channel].Remove(nick);
-            InvalidateChannelsCache();
+            QueuePendingNamesRemove(channel, nick);
+
+            if (_channels.ContainsKey(channel))
+            {
+                _channels[channel].Remove(nick);
+                InvalidateChannelsCache();
+            }
         }
 
         RaiseEventAsync(UserLeftChannel, new UserLeftChannelEvent(message, nick, user, host, channel, reason));
@@ -1652,6 +1677,7 @@ public class IrcClient : IIrcClient
         {
             channel.Remove(nick);
         }
+        QueuePendingNamesRemoveFromAllChannels(nick);
         InvalidateChannelsCache();
 
         // Remove from user info tracking
@@ -1773,6 +1799,7 @@ public class IrcClient : IIrcClient
         if (kickedNick == _currentNick)
         {
             _channels.TryRemove(channel, out _);
+            _pendingNamesUsers.TryRemove(channel, out _);
             InvalidateChannelsCache();
 
             // Auto-rejoin if enabled
@@ -1785,10 +1812,15 @@ public class IrcClient : IIrcClient
                 }, "AutoRejoinOnKick");
             }
         }
-        else if (_channels.ContainsKey(channel))
+        else
         {
-            _channels[channel].Remove(kickedNick);
-            InvalidateChannelsCache();
+            QueuePendingNamesRemove(channel, kickedNick);
+
+            if (_channels.ContainsKey(channel))
+            {
+                _channels[channel].Remove(kickedNick);
+                InvalidateChannelsCache();
+            }
         }
 
         RaiseEventAsync(UserKicked, new UserKickedEvent(message, channel, kickedNick, kickedByNick, reason));
@@ -1857,15 +1889,15 @@ public class IrcClient : IIrcClient
         if (message.Parameters.Count < 4) return;
 
         var channel = message.Parameters[2];
-        var userList = message.Parameters[3]; if (!_channels.ContainsKey(channel))
-            _channels[channel] = new ConcurrentHashSet<string>();
+        var userList = message.Parameters[3];
+
+        var pendingNamesState = _pendingNamesUsers.GetOrAdd(channel, static _ => new PendingNamesState());
 
         var users = ParseChannelUsers(userList);
         foreach (var user in users)
         {
-            _channels[channel].Add(user.Nick);
+            pendingNamesState.Snapshot[user.Nick] = user;
         }
-        InvalidateChannelsCache();
     }
 
     private void HandleEndOfNames(IrcMessage message)
@@ -1873,10 +1905,86 @@ public class IrcClient : IIrcClient
         if (message.Parameters.Count < 2) return;
 
         var channel = message.Parameters[1];
+
+        if (_pendingNamesUsers.TryRemove(channel, out var pendingNamesState))
+        {
+            var usersByNick = new Dictionary<string, ChannelUser>(pendingNamesState.Snapshot, StringComparer.OrdinalIgnoreCase);
+
+            while (pendingNamesState.Mutations.TryDequeue(out var mutation))
+            {
+                ApplyPendingNamesMutation(usersByNick, mutation);
+            }
+
+            var replacementUsers = usersByNick.Values.ToList();
+            var replacementSet = new ConcurrentHashSet<string>();
+
+            foreach (var user in replacementUsers)
+            {
+                replacementSet.Add(user.Nick);
+            }
+
+            _channels[channel] = replacementSet;
+            InvalidateChannelsCache();
+            RaiseEventAsync(ChannelUsersReceived, new ChannelUsersEvent(message, channel, replacementUsers));
+            return;
+        }
+
         if (_channels.ContainsKey(channel))
         {
             var users = _channels[channel].Select(nick => new ChannelUser { Nick = nick }).ToList();
             RaiseEventAsync(ChannelUsersReceived, new ChannelUsersEvent(message, channel, users));
+        }
+    }
+
+    private void QueuePendingNamesAdd(string channel, string nick)
+    {
+        if (_pendingNamesUsers.TryGetValue(channel, out var pendingNamesState))
+        {
+            pendingNamesState.Mutations.Enqueue(new PendingNamesMutation(PendingNamesMutationKind.Add, nick));
+        }
+    }
+
+    private void QueuePendingNamesRemove(string channel, string nick)
+    {
+        if (_pendingNamesUsers.TryGetValue(channel, out var pendingNamesState))
+        {
+            pendingNamesState.Mutations.Enqueue(new PendingNamesMutation(PendingNamesMutationKind.Remove, nick));
+        }
+    }
+
+    private void QueuePendingNamesRemoveFromAllChannels(string nick)
+    {
+        foreach (var pendingNamesState in _pendingNamesUsers.Values)
+        {
+            pendingNamesState.Mutations.Enqueue(new PendingNamesMutation(PendingNamesMutationKind.Remove, nick));
+        }
+    }
+
+    private void QueuePendingNamesRename(string oldNick, string newNick)
+    {
+        foreach (var pendingNamesState in _pendingNamesUsers.Values)
+        {
+            pendingNamesState.Mutations.Enqueue(new PendingNamesMutation(PendingNamesMutationKind.Rename, oldNick, newNick));
+        }
+    }
+
+    private static void ApplyPendingNamesMutation(Dictionary<string, ChannelUser> usersByNick, PendingNamesMutation mutation)
+    {
+        switch (mutation.Kind)
+        {
+            case PendingNamesMutationKind.Add:
+                usersByNick.TryAdd(mutation.Nick, new ChannelUser { Nick = mutation.Nick });
+                break;
+            case PendingNamesMutationKind.Remove:
+                usersByNick.Remove(mutation.Nick);
+                break;
+            case PendingNamesMutationKind.Rename:
+                if (!string.IsNullOrEmpty(mutation.NewNick) && usersByNick.Remove(mutation.Nick, out var renamedUser))
+                {
+                    renamedUser.Nick = mutation.NewNick;
+                    usersByNick[mutation.NewNick] = renamedUser;
+                }
+                break;
         }
     }
 
@@ -2052,7 +2160,7 @@ public class IrcClient : IIrcClient
 
             if (shouldDisconnect)
             {
-                SafeFireAndForget(() => DisconnectInternalAsync("Ping timeout"), "PingTimeoutDisconnect");
+                SafeFireAndForget(() => HandleUnexpectedDisconnectAsync("Ping timeout"), "PingTimeoutDisconnect");
                 return;
             }
 
@@ -2669,6 +2777,7 @@ public class IrcClient : IIrcClient
         }
 
         _pendingMonitoredOfflines.TryRemove(oldNick, out _);
+        QueuePendingNamesRename(oldNick, newNick);
 
         var isMonitoredNick = _monitoredNicks.Contains(oldNick);
 
@@ -2923,6 +3032,22 @@ public class IrcClient : IIrcClient
     }
 
     private sealed record MonitorTarget(string Nick, string User, string Host);
+
+    private sealed class PendingNamesState
+    {
+        public ConcurrentDictionary<string, ChannelUser> Snapshot { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        public ConcurrentQueue<PendingNamesMutation> Mutations { get; } = new();
+    }
+
+    private enum PendingNamesMutationKind
+    {
+        Add,
+        Remove,
+        Rename
+    }
+
+    private sealed record PendingNamesMutation(PendingNamesMutationKind Kind, string Nick, string? NewNick = null);
 
     private sealed record PendingMonitoredOffline(IrcMessage Message, string Nick, string User, string Host, DateTimeOffset Timestamp);
 

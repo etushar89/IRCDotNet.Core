@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Reflection;
 using FluentAssertions;
 using IRCDotNet.Core;
@@ -320,6 +321,118 @@ public class IrcClientTests : IDisposable
     }
 
     [Fact]
+    public async Task SendPing_WhenPongTimesOut_ShouldScheduleReconnectAttemptAndPreserveChannelsToRejoin()
+    {
+        var options = new IrcClientOptions
+        {
+            Server = "127.0.0.1",
+            Port = 1,
+            Nick = "testbot",
+            UserName = "testuser",
+            RealName = "Test Bot",
+            UseSsl = false,
+            EnableRateLimit = false,
+            AutoReconnect = true,
+            ConnectionTimeoutMs = 50,
+            PingIntervalMs = 10,
+            PingTimeoutMs = 25,
+            ReconnectDelayMs = 1,
+            MaxReconnectDelayMs = 1,
+            MaxReconnectAttempts = 1,
+        };
+
+        using var client = new IrcClient(options, NullLogger<IrcClient>.Instance);
+        var disconnectedReason = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        client.Disconnected += (_, e) => disconnectedReason.TrySetResult(e.Reason);
+
+        SetPrivateField(client, "_transport", new BlockingTransport());
+        SetPrivateField(client, "_cancellationTokenSource", new CancellationTokenSource());
+        SetPrivateField(client, "_isConnected", true);
+        SetPrivateField(client, "_currentNick", options.Nick);
+        SetPrivateField(client, "_lastPongReceived", DateTimeOffset.UtcNow - TimeSpan.FromMilliseconds(options.PingTimeoutMs + 100));
+
+        var channels = GetPrivateField<ConcurrentDictionary<string, IRCDotNet.Core.Utilities.ConcurrentHashSet<string>>>(client, "_channels");
+        channels.Should().NotBeNull();
+
+        var roomUsers = new IRCDotNet.Core.Utilities.ConcurrentHashSet<string>();
+        roomUsers.Add("alice");
+        channels!["#room"] = roomUsers;
+
+        InvokePrivateMethod(client, "SendPing", new object?[] { null });
+
+        (await disconnectedReason.Task.WaitAsync(TimeSpan.FromSeconds(5))).Should().Be("Ping timeout");
+
+        await WaitForConditionAsync(
+            () => GetPrivateField<int>(client, "_reconnectAttempts") == 1,
+            TimeSpan.FromSeconds(5));
+
+        GetPrivateField<List<string>>(client, "_channelsToRejoin").Should().Equal("#room");
+    }
+
+    [Fact]
+    public async Task ProcessMessageAsync_WhenLaterNamesSnapshotOmitsUsers_ShouldReplaceMembershipAndPreservePrefixes()
+    {
+        var receivedSnapshots = new List<string[]>();
+
+        _client.ChannelUsersReceived += (_, e) =>
+        {
+            receivedSnapshots.Add(
+                e.Users
+                    .OrderBy(user => user.Nick, StringComparer.OrdinalIgnoreCase)
+                    .Select(user => $"{new string(user.Prefixes.ToArray())}{user.Nick}")
+                    .ToArray());
+        };
+
+        await InvokePrivateMethodAsync(_client, "ProcessMessageAsync", IrcMessage.Parse(":server 353 testbot = #room :@alice bob"));
+        await InvokePrivateMethodAsync(_client, "ProcessMessageAsync", IrcMessage.Parse(":server 366 testbot #room :End of /NAMES list."));
+        await InvokePrivateMethodAsync(_client, "ProcessMessageAsync", IrcMessage.Parse(":server 353 testbot = #room :@alice"));
+        await InvokePrivateMethodAsync(_client, "ProcessMessageAsync", IrcMessage.Parse(":server 366 testbot #room :End of /NAMES list."));
+
+        await WaitForConditionAsync(() => receivedSnapshots.Count == 2, TimeSpan.FromSeconds(5));
+
+        receivedSnapshots.Should().HaveCount(2);
+        receivedSnapshots[0].Should().Equal("@alice", "bob");
+        receivedSnapshots[1].Should().Equal("@alice");
+        _client.Channels.Should().ContainKey("#room");
+        _client.Channels["#room"]
+            .OrderBy(nick => nick, StringComparer.OrdinalIgnoreCase)
+            .Should().Equal("alice");
+    }
+
+    [Fact]
+    public async Task ProcessMessageAsync_WhenNamesSnapshotInterleavesMembershipChanges_ShouldApplyLiveDeltasAfterEndOfNames()
+    {
+        var receivedSnapshots = new List<string[]>();
+
+        _client.ChannelUsersReceived += (_, e) =>
+        {
+            receivedSnapshots.Add(
+                e.Users
+                    .OrderBy(user => user.Nick, StringComparer.OrdinalIgnoreCase)
+                    .Select(user => $"{new string(user.Prefixes.ToArray())}{user.Nick}")
+                    .ToArray());
+        };
+
+        await InvokePrivateMethodAsync(_client, "ProcessMessageAsync", IrcMessage.Parse(":server 353 testbot = #room :@alice"));
+        await InvokePrivateMethodAsync(_client, "ProcessMessageAsync", IrcMessage.Parse(":bob!user@host JOIN #room"));
+        await InvokePrivateMethodAsync(_client, "ProcessMessageAsync", IrcMessage.Parse(":bob!user@host NICK robert"));
+        await InvokePrivateMethodAsync(_client, "ProcessMessageAsync", IrcMessage.Parse(":alice!user@host QUIT :gone"));
+        await InvokePrivateMethodAsync(_client, "ProcessMessageAsync", IrcMessage.Parse(":carol!user@host JOIN #room"));
+        await InvokePrivateMethodAsync(_client, "ProcessMessageAsync", IrcMessage.Parse(":server 353 testbot = #room :dave"));
+        await InvokePrivateMethodAsync(_client, "ProcessMessageAsync", IrcMessage.Parse(":server 366 testbot #room :End of /NAMES list."));
+
+        await WaitForConditionAsync(() => receivedSnapshots.Count == 1, TimeSpan.FromSeconds(5));
+
+        receivedSnapshots.Should().ContainSingle();
+        receivedSnapshots[0].Should().Equal("carol", "dave", "robert");
+        _client.Channels.Should().ContainKey("#room");
+        _client.Channels["#room"]
+            .OrderBy(nick => nick, StringComparer.OrdinalIgnoreCase)
+            .Should().Equal("carol", "dave", "robert");
+    }
+
+    [Fact]
     public void ClientProperties_ShouldBeAccessible()
     {
         // Assert - These should compile without error
@@ -352,6 +465,44 @@ public class IrcClientTests : IDisposable
         var field = typeof(IrcClient).GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic);
         field.Should().NotBeNull();
         field!.SetValue(client, value);
+    }
+
+    private static T? GetPrivateField<T>(IrcClient client, string fieldName)
+    {
+        var field = typeof(IrcClient).GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic);
+        field.Should().NotBeNull();
+        return (T?)field!.GetValue(client);
+    }
+
+    private static object? InvokePrivateMethod(IrcClient client, string methodName, params object?[]? arguments)
+    {
+        var method = typeof(IrcClient).GetMethod(methodName, BindingFlags.Instance | BindingFlags.NonPublic);
+        method.Should().NotBeNull();
+        return method!.Invoke(client, arguments);
+    }
+
+    private static async Task InvokePrivateMethodAsync(IrcClient client, string methodName, params object?[]? arguments)
+    {
+        var result = InvokePrivateMethod(client, methodName, arguments);
+        if (result is Task task)
+        {
+            await task.ConfigureAwait(false);
+        }
+    }
+
+    private static async Task WaitForConditionAsync(Func<bool> predicate, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+
+        while (DateTime.UtcNow < deadline)
+        {
+            if (predicate())
+                return;
+
+            await Task.Delay(25).ConfigureAwait(false);
+        }
+
+        predicate().Should().BeTrue();
     }
 
     private static PrivateMessageEvent CreatePrivateMessageEvent(string text)
