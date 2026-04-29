@@ -4,8 +4,8 @@ using System.Threading.Tasks;
 using IRCDotNet.Core;
 using IRCDotNet.Core.Configuration;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
-using Xunit.Abstractions;
 
 namespace IRCDotNet.Tests.Resilience;
 
@@ -14,16 +14,12 @@ namespace IRCDotNet.Tests.Resilience;
 /// </summary>
 public class ResilienceTests : IDisposable
 {
-    private readonly ITestOutputHelper _output;
     private readonly ILogger<IrcClient> _logger;
     private readonly List<IrcClient> _clients = new();
 
-    public ResilienceTests(ITestOutputHelper output)
+    public ResilienceTests()
     {
-        _output = output;
-        var loggerFactory = LoggerFactory.Create(builder =>
-            builder.AddConsole().SetMinimumLevel(LogLevel.Information));
-        _logger = loggerFactory.CreateLogger<IrcClient>();
+        _logger = NullLogger<IrcClient>.Instance;
     }
 
     [Fact]

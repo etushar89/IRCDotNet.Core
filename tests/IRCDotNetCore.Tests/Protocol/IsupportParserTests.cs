@@ -1,3 +1,5 @@
+using IRCDotNet.Core;
+using IRCDotNet.Core.Configuration;
 using IRCDotNet.Core.Protocol;
 using Xunit;
 
@@ -211,6 +213,43 @@ public class IsupportParserTests
         };
         parser.ParseIsupport(rfc1459Message);
         Assert.Equal(CaseMappingType.Rfc1459, parser.CaseMapping);
+    }
+
+    [Fact]
+    public void CaseMapping_UnknownType_ReturnsRfc1459Fallback()
+    {
+        // Arrange
+        var parser = new IsupportParser();
+        var message = new IrcMessage
+        {
+            Command = "005",
+            Parameters = new List<string> { "TestUser", "CASEMAPPING=vendor-specific", "test" }
+        };
+
+        // Act
+        parser.ParseIsupport(message);
+
+        // Assert
+        Assert.Equal(CaseMappingType.Rfc1459, parser.CaseMapping);
+    }
+
+    [Fact]
+    public void GetServerCaseMapping_BeforeIsupport_ReturnsDefaultRfc1459()
+    {
+        // Arrange
+        using var client = new IrcClient(new IrcClientOptions
+        {
+            Server = "irc.example.net",
+            Nick = "tester",
+            UserName = "tester",
+            RealName = "Test User"
+        });
+
+        // Act
+        var caseMapping = client.GetServerCaseMapping();
+
+        // Assert
+        Assert.Equal(CaseMappingType.Rfc1459, caseMapping);
     }
 
     [Fact]

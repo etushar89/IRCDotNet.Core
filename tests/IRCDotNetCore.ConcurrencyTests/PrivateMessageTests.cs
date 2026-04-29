@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 using IRCDotNet.Core;
 using IRCDotNet.Core.Configuration;
@@ -143,6 +144,122 @@ public class PrivateMessageTests : IDisposable
         }
 
         _output.WriteLine("✅ Bidirectional DM exchange completed successfully");
+    }
+
+    /// <summary>
+    /// Three users exchange a human-paced scripted conversation and every receiver
+    /// verifies the exact ordered message stream it should observe.
+    /// </summary>
+    [Fact(Timeout = 120000)]
+    public async Task ThreeUsers_HumanPacedEdgeCaseChat_ShouldDeliverEveryMessageInOrder()
+    {
+        const int participantCount = 3;
+        var suffix = DateTimeOffset.UtcNow.Ticks % 10000;
+        var nicks = Enumerable.Range(0, participantCount).Select(index => $"Chat{index}_{suffix}").ToArray();
+        var messagePrefix = $"HC{suffix}:";
+        var clients = new IrcClient[participantCount];
+        var receivedByParticipant = Enumerable.Range(0, participantCount).Select(_ => new List<HumanChatReceipt>()).ToArray();
+        var receiveGates = Enumerable.Range(0, participantCount).Select(_ => new object()).ToArray();
+        var sentCounts = new int[participantCount];
+        var sendFailures = new ConcurrentBag<string>();
+        var chatTurns = CreateHumanChatTurns();
+
+        _output.WriteLine($"=== Connecting {participantCount} human-paced chat participants ===");
+        for (var participantIndex = 0; participantIndex < participantCount; participantIndex++)
+        {
+            clients[participantIndex] = await ConnectSingleUserAsync(nicks[participantIndex]);
+        }
+
+        for (var participantIndex = 0; participantIndex < participantCount; participantIndex++)
+        {
+            var receiverIndex = participantIndex;
+            clients[participantIndex].PrivateMessageReceived += (_, eventArgs) =>
+            {
+                if (eventArgs.IsChannelMessage
+                    || string.Equals(eventArgs.Nick, nicks[receiverIndex], StringComparison.OrdinalIgnoreCase)
+                    || !TryParseHumanChatSequence(eventArgs.Text, messagePrefix, out var sequence))
+                {
+                    return;
+                }
+
+                lock (receiveGates[receiverIndex])
+                {
+                    receivedByParticipant[receiverIndex].Add(new HumanChatReceipt(sequence, eventArgs.Nick, eventArgs.Text));
+                }
+            };
+        }
+
+        _output.WriteLine($"=== Sending {chatTurns.Count} chat turns at human messaging cadence ===");
+        foreach (var chatTurn in chatTurns)
+        {
+            var sender = clients[chatTurn.SenderIndex];
+            var text = $"{messagePrefix}{chatTurn.Sequence:D2}:{chatTurn.Text}";
+            Assert.True(Encoding.UTF8.GetByteCount(text) < 400, $"Payload {chatTurn.Sequence} should remain safely below IRC line length limits.");
+
+            for (var targetIndex = 0; targetIndex < participantCount; targetIndex++)
+            {
+                if (targetIndex == chatTurn.SenderIndex)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    await sender.SendMessageAsync(nicks[targetIndex], text);
+                    sentCounts[chatTurn.SenderIndex]++;
+                }
+                catch (Exception exception)
+                {
+                    sendFailures.Add($"turn {chatTurn.Sequence} {nicks[chatTurn.SenderIndex]}->{nicks[targetIndex]}: {exception.GetType().Name}");
+                }
+
+                await Task.Delay(150, _testCancellation.Token);
+            }
+
+            await Task.Delay(1200, _testCancellation.Token);
+        }
+
+        Assert.Empty(sendFailures);
+
+        var deliveryDeadline = DateTimeOffset.UtcNow.AddSeconds(30);
+        while (DateTimeOffset.UtcNow < deliveryDeadline
+               && receivedByParticipant.Select((receipts, participantIndex) => receipts.Count < chatTurns.Count(turn => turn.SenderIndex != participantIndex)).Any(waiting => waiting))
+        {
+            await Task.Delay(250, _testCancellation.Token);
+        }
+
+        for (var participantIndex = 0; participantIndex < participantCount; participantIndex++)
+        {
+            var expectedSentCount = chatTurns.Count(turn => turn.SenderIndex == participantIndex) * (participantCount - 1);
+            Assert.Equal(expectedSentCount, sentCounts[participantIndex]);
+
+            List<HumanChatReceipt> actualReceipts;
+            lock (receiveGates[participantIndex])
+            {
+                actualReceipts = receivedByParticipant[participantIndex].ToList();
+            }
+
+            var expectedReceipts = chatTurns
+                .Where(turn => turn.SenderIndex != participantIndex)
+                .Select(turn => new HumanChatReceipt(turn.Sequence, nicks[turn.SenderIndex], $"{messagePrefix}{turn.Sequence:D2}:{turn.Text}"))
+                .ToArray();
+
+            Assert.Equal(expectedReceipts.Length, actualReceipts.Count);
+            for (var receiptIndex = 0; receiptIndex < expectedReceipts.Length; receiptIndex++)
+            {
+                Assert.Equal(expectedReceipts[receiptIndex].Sequence, actualReceipts[receiptIndex].Sequence);
+                Assert.Equal(expectedReceipts[receiptIndex].FromNick, actualReceipts[receiptIndex].FromNick);
+                Assert.Equal(expectedReceipts[receiptIndex].Text, actualReceipts[receiptIndex].Text);
+            }
+
+            Assert.True(clients[participantIndex].IsConnected, $"{nicks[participantIndex]} should stay connected through the human-paced chat.");
+        }
+
+        var invalidMultiline = $"{messagePrefix}99:actual CRLF is invalid\r\nsecond line";
+        await Assert.ThrowsAsync<ArgumentException>(() => clients[0].SendMessageAsync(nicks[1], invalidMultiline));
+        Assert.All(clients, client => Assert.True(client.IsConnected));
+
+        _output.WriteLine("✅ Human-paced edge-case chat delivered every expected message in order");
     }
 
     /// <summary>
@@ -840,6 +957,48 @@ public class PrivateMessageTests : IDisposable
         if (!options.RequestedCapabilities.Contains(IrcCapabilities.EXTENDED_MONITOR, StringComparer.OrdinalIgnoreCase))
             options.RequestedCapabilities.Add(IrcCapabilities.EXTENDED_MONITOR);
     }
+
+    private static IReadOnlyList<HumanChatTurn> CreateHumanChatTurns()
+    {
+        return
+        [
+            new HumanChatTurn(0, 0, "Plain ASCII hello with numbers 12345."),
+            new HumanChatTurn(1, 1, "Punctuation: !?.,;:'\"()[]{}<> @#$%^&*_-+=/\\|~`"),
+            new HumanChatTurn(2, 2, "Latin accents: café naïve résumé coöperate São Paulo."),
+            new HumanChatTurn(3, 0, "Cyrillic: Привет мир. До встречи."),
+            new HumanChatTurn(4, 1, "CJK: こんにちは世界 | 你好世界 | 안녕하세요 세계."),
+            new HumanChatTurn(5, 2, "RTL scripts: مرحبا بالعالم | שלום עולם."),
+            new HumanChatTurn(6, 0, "Emoji: 😀 🚀 ✨ 👍🏽 🎉."),
+            new HumanChatTurn(7, 1, "ZWJ emoji: family 👨‍👩‍👧‍👦, technologist 🧑‍💻."),
+            new HumanChatTurn(8, 2, "Math and currency: ∑ Δ π ≈ √∞ € £ ¥ ₹."),
+            new HumanChatTurn(9, 0, "Display line separators: first\u2028second\u2029third."),
+            new HumanChatTurn(10, 1, "Escaped newline literals: first\\nsecond\\r\\nthird."),
+            new HumanChatTurn(11, 2, "IRC formatting: \u0002bold\u0002 \u001Ditalic\u001D \u001Funderline\u001F \u000303green\u000F reset."),
+            new HumanChatTurn(12, 0, "Quotes and brackets: \"double\" 'single' «angle» ‘curly’."),
+            new HumanChatTurn(13, 1, "Whitespace markers: [  leading and trailing style spaces  ] tabs-as-text \\t."),
+            new HumanChatTurn(14, 2, string.Concat("Long mixed safe payload: ", new string('x', 120)))
+        ];
+    }
+
+    private static bool TryParseHumanChatSequence(string text, string messagePrefix, out int sequence)
+    {
+        sequence = -1;
+        if (!text.StartsWith(messagePrefix, StringComparison.Ordinal) || text.Length < messagePrefix.Length + 3)
+        {
+            return false;
+        }
+
+        if (text[messagePrefix.Length + 2] != ':')
+        {
+            return false;
+        }
+
+        return int.TryParse(text.AsSpan(messagePrefix.Length, 2), NumberStyles.None, CultureInfo.InvariantCulture, out sequence);
+    }
+
+    private sealed record HumanChatTurn(int Sequence, int SenderIndex, string Text);
+
+    private sealed record HumanChatReceipt(int Sequence, string FromNick, string Text);
 
     public void Dispose()
     {

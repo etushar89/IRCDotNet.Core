@@ -321,6 +321,30 @@ public class IrcClientTests : IDisposable
     }
 
     [Fact]
+    public async Task DisconnectAsync_WhenQuitWriteDoesNotComplete_ShouldStillFinishCleanup()
+    {
+        var options = new IrcClientOptions
+        {
+            Server = "irc.example.com",
+            Port = 6667,
+            Nick = "testbot",
+            UserName = "testuser",
+            RealName = "Test Bot",
+            UseSsl = false,
+            SendTimeoutCancelledMs = 50
+        };
+        using var client = new IrcClient(options, NullLogger<IrcClient>.Instance);
+        var transport = new BlockingTransport { IgnoreWriteCancellation = true };
+        SetPrivateField(client, "_transport", transport);
+        SetPrivateField(client, "_cancellationTokenSource", new CancellationTokenSource());
+        SetPrivateField(client, "_isConnected", true);
+
+        await client.DisconnectAsync("test shutdown").WaitAsync(TimeSpan.FromSeconds(5));
+
+        client.IsConnected.Should().BeFalse();
+    }
+
+    [Fact]
     public async Task SendPing_WhenPongTimesOut_ShouldScheduleReconnectAttemptAndPreserveChannelsToRejoin()
     {
         var options = new IrcClientOptions
@@ -534,6 +558,8 @@ public class IrcClientTests : IDisposable
 
         public Task FirstWriteStarted => _firstWriteStarted.Task;
 
+        public bool IgnoreWriteCancellation { get; init; }
+
         private List<string> _writtenLines { get; } = new();
 
         public Task ConnectAsync(CancellationToken cancellationToken = default)
@@ -562,7 +588,14 @@ public class IrcClientTests : IDisposable
                 if (writeIndex == 1)
                 {
                     _firstWriteStarted.TrySetResult();
-                    await _allowFirstWriteToComplete.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    if (IgnoreWriteCancellation)
+                    {
+                        await _allowFirstWriteToComplete.Task.ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await _allowFirstWriteToComplete.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    }
                 }
             }
             finally

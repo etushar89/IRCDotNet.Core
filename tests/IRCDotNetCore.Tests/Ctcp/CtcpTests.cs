@@ -321,7 +321,6 @@ public class CtcpTests
     public void SendCtcpReply_ShouldFormatAsNotice()
     {
         // CTCP replies go via NOTICE, not PRIVMSG
-        var target = "someuser";
         var command = "VERSION";
         var replyText = "IRCDotNet.Core";
 

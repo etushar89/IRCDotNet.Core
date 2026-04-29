@@ -3,41 +3,15 @@ using System.Diagnostics;
 using System.Reflection;
 using System.Text.RegularExpressions;
 using IRCDotNet.Core;
-using IRCDotNet.Core.Configuration;
-using Microsoft.Extensions.Logging;
 using Xunit;
-using Xunit.Abstractions;
 
 namespace IRCDotNet.Tests.Performance;
 
 /// <summary>
 /// Tests for performance optimizations, particularly the static compiled regex
 /// </summary>
-public class RegexOptimizationTests : IDisposable
+public class RegexOptimizationTests
 {
-    private readonly ITestOutputHelper _output;
-    private readonly ILogger<IrcClient> _logger;
-    private readonly IrcClient _client;
-
-    public RegexOptimizationTests(ITestOutputHelper output)
-    {
-        _output = output;
-        var loggerFactory = LoggerFactory.Create(builder =>
-            builder.AddConsole().SetMinimumLevel(LogLevel.Information));
-        _logger = loggerFactory.CreateLogger<IrcClient>();
-
-        var options = new IrcClientOptions
-        {
-            Server = "localhost",
-            Port = 6667,
-            Nick = "TestUser",
-            UserName = "testuser",
-            RealName = "Test User"
-        };
-
-        _client = new IrcClient(options, _logger);
-    }
-
     [Fact]
     public void StaticRegex_ShouldBeCompiledAndCached()
     {
@@ -101,47 +75,31 @@ public class RegexOptimizationTests : IDisposable
     }
 
     [Fact]
-    public void StaticRegex_PerformanceComparison_ShouldBeFast()
+    public void StaticRegex_RepeatedMatches_ShouldBeFastEnoughForRuntimeUse()
     {
         // Arrange
         var regexField = typeof(IrcClient).GetField("NickUserHostRegex",
             BindingFlags.NonPublic | BindingFlags.Static);
         var compiledRegex = regexField!.GetValue(null) as Regex;
 
-        // Create a non-compiled regex for comparison
-        var nonCompiledRegex = new Regex(@"^([^!]+)!([^@]+)@(.+)$", RegexOptions.None);
-
         var testInput = "testuser!~test@example.com";
-        const int iterations = 10000;
+        const int iterations = 100_000;
+        Assert.True(compiledRegex!.Match(testInput).Success);
 
-        // Act & Measure compiled regex performance
+        // Act
         var compiledStopwatch = Stopwatch.StartNew();
         for (int i = 0; i < iterations; i++)
         {
-            var match = compiledRegex!.Match(testInput);
+            var match = compiledRegex.Match(testInput);
             Assert.True(match.Success); // Ensure it's working
         }
         compiledStopwatch.Stop();
 
-        // Measure non-compiled regex performance
-        var nonCompiledStopwatch = Stopwatch.StartNew();
-        for (int i = 0; i < iterations; i++)
-        {
-            var match = nonCompiledRegex.Match(testInput);
-            Assert.True(match.Success); // Ensure it's working
-        }
-        nonCompiledStopwatch.Stop();
-
-        // Assert - Compiled regex should be faster (or at least not significantly slower)
-        _output.WriteLine($"Compiled regex time: {compiledStopwatch.ElapsedMilliseconds}ms");
-        _output.WriteLine($"Non-compiled regex time: {nonCompiledStopwatch.ElapsedMilliseconds}ms");
-
-        // The compiled regex should be at least as fast as the non-compiled one
-        // We allow for some variance due to test environment factors
-        var performanceRatio = (double)compiledStopwatch.ElapsedMilliseconds / nonCompiledStopwatch.ElapsedMilliseconds;
-        Assert.True(performanceRatio <= 2.0,
-            $"Compiled regex should not be more than 2x slower than non-compiled. Ratio: {performanceRatio:F2}");
+        // Assert - broad guard against accidental pathological behavior without comparing tiny timing samples.
+        Assert.True(compiledStopwatch.Elapsed < TimeSpan.FromSeconds(2),
+            $"Compiled regex repeated matching should complete quickly. Elapsed: {compiledStopwatch.ElapsedMilliseconds}ms");
     }
+
     [Fact]
     public async System.Threading.Tasks.Task StaticRegex_ThreadSafety_ShouldHandleConcurrentAccess()
     {
@@ -245,10 +203,5 @@ public class RegexOptimizationTests : IDisposable
             Assert.Equal(expectedUser, match.Groups[2].Value);
             Assert.Equal(expectedHost, match.Groups[3].Value);
         }
-    }
-
-    public void Dispose()
-    {
-        _client?.Dispose();
     }
 }

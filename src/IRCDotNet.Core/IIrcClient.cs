@@ -161,6 +161,10 @@ public interface IIrcClient : IDisposable, IAsyncDisposable
     /// <summary>Gets the supported channel types from ISUPPORT.</summary>
     string GetServerChannelTypes();
 
+    /// <summary>Gets the server case mapping from ISUPPORT.</summary>
+    /// <returns>The server case mapping used for nickname and channel comparison.</returns>
+    Protocol.CaseMappingType GetServerCaseMapping();
+
     // ── Utilities ────────────────────────────────────────────────────
 
     /// <summary>Compares two nicknames using the server's case mapping rules.</summary>

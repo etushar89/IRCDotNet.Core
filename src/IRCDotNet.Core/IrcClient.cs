@@ -357,14 +357,14 @@ public class IrcClient : IIrcClient
         {
             if (!string.IsNullOrEmpty(reason))
             {
-                await SendRawAsync($"QUIT :{reason}").ConfigureAwait(false);
+                await SendQuitForDisconnectAsync($"QUIT :{reason}").ConfigureAwait(false);
             }
             else
             {
-                await SendRawAsync("QUIT").ConfigureAwait(false);
+                await SendQuitForDisconnectAsync("QUIT").ConfigureAwait(false);
             }
         }
-        catch (TaskCanceledException)
+        catch (OperationCanceledException)
         {
             // If cancellation was requested, skip sending QUIT and proceed with disconnect
             _logger?.LogDebug("Skipping QUIT message due to cancellation");
@@ -415,30 +415,10 @@ public class IrcClient : IIrcClient
 
         // Close the transport before awaiting the read loop so a server-side QUIT that leaves
         // the socket open cannot deadlock client shutdown.
-        try
-        {
-            if (_transport != null)
-                await _transport.DisconnectAsync().ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogWarning(ex, "Error disposing transport during disconnect");
-        }
+        await DisconnectTransportForShutdownAsync(_transport).ConfigureAwait(false);
 
         // Wait for read loop to complete gracefully
-        try
-        {
-            if (_readLoopTask != null)
-                await _readLoopTask.ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected when cancellation is requested
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogWarning(ex, "Error waiting for read loop completion during disconnect");
-        }
+        await WaitForReadLoopShutdownAsync(_readLoopTask).ConfigureAwait(false);
 
         try
         {
@@ -1555,6 +1535,81 @@ public class IrcClient : IIrcClient
         {
             SafeFireAndForget(() => EndCapabilityNegotiationAsync(), "SaslFailureCapEnd");
         }
+    }
+
+    private async Task SendQuitForDisconnectAsync(string quitMessage)
+    {
+        var timeout = GetShutdownOperationTimeout();
+        using var shutdownCancellation = new CancellationTokenSource(timeout);
+        var sendTask = SendRawWithCancellationAsync(quitMessage, shutdownCancellation.Token);
+        try
+        {
+            await sendTask.WaitAsync(timeout).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            ObserveFault(sendTask);
+            _logger?.LogWarning("Timed out sending QUIT during disconnect");
+        }
+    }
+
+    private async Task DisconnectTransportForShutdownAsync(IIrcTransport? transport)
+    {
+        if (transport == null)
+        {
+            return;
+        }
+
+        var disconnectTask = transport.DisconnectAsync();
+        try
+        {
+            await disconnectTask.WaitAsync(GetShutdownOperationTimeout()).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            ObserveFault(disconnectTask);
+            _logger?.LogWarning("Timed out closing transport during disconnect");
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning(ex, "Error disposing transport during disconnect");
+        }
+    }
+
+    private async Task WaitForReadLoopShutdownAsync(Task? readLoopTask)
+    {
+        if (readLoopTask == null)
+        {
+            return;
+        }
+
+        try
+        {
+            await readLoopTask.WaitAsync(GetShutdownOperationTimeout()).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            ObserveFault(readLoopTask);
+            _logger?.LogWarning("Timed out waiting for read loop completion during disconnect");
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected when cancellation is requested
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning(ex, "Error waiting for read loop completion during disconnect");
+        }
+    }
+
+    private TimeSpan GetShutdownOperationTimeout()
+    {
+        return TimeSpan.FromMilliseconds(Math.Max(1, _options.SendTimeoutCancelledMs));
+    }
+
+    private static void ObserveFault(Task task)
+    {
+        _ = task.ContinueWith(static completedTask => _ = completedTask.Exception, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 
     private void HandleSaslAborted(IrcMessage message)
@@ -3344,6 +3399,12 @@ public class IrcClient : IIrcClient
     /// </summary>
     /// <returns>String of channel type prefix characters.</returns>
     public string GetServerChannelTypes() => _isupportParser.ChannelTypes;
+
+    /// <summary>
+    /// Gets the server's CASEMAPPING value from ISUPPORT (005) parameters.
+    /// </summary>
+    /// <returns>The server case mapping used for nickname and channel comparison.</returns>
+    public CaseMappingType GetServerCaseMapping() => _isupportParser.CaseMapping;
 
     /// <summary>
     /// Compares two nicknames using the server's CASEMAPPING rules.
