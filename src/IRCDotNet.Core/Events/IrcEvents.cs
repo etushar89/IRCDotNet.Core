@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using IRCDotNet.Core.Protocol;
 
 namespace IRCDotNet.Core.Events;
@@ -501,6 +502,71 @@ public class CapabilitiesNegotiatedEvent : IrcEvent
     {
         EnabledCapabilities = new HashSet<string>(enabledCapabilities);
         SupportedCapabilities = new HashSet<string>(supportedCapabilities);
+    }
+}
+
+/// <summary>
+/// Event raised after the server's ISUPPORT features have been parsed.
+/// </summary>
+public class IsupportReceivedEvent : IrcEvent
+{
+    /// <summary>Parsed ISUPPORT feature values keyed by feature name.</summary>
+    public IReadOnlyDictionary<string, string?> Features { get; }
+    /// <summary>Server network name, or <c>null</c> if it was not advertised.</summary>
+    public string? NetworkName { get; }
+    /// <summary>Maximum allowed nickname length.</summary>
+    public int MaxNicknameLength { get; }
+    /// <summary>Maximum allowed channel name length.</summary>
+    public int MaxChannelLength { get; }
+    /// <summary>Maximum allowed topic length.</summary>
+    public int MaxTopicLength { get; }
+    /// <summary>Maximum allowed kick message length.</summary>
+    public int MaxKickLength { get; }
+    /// <summary>Maximum allowed away message length.</summary>
+    public int MaxAwayLength { get; }
+    /// <summary>Maximum number of targets for multi-target commands.</summary>
+    public int MaxTargets { get; }
+    /// <summary>Maximum number of joined channels, or <see cref="int.MaxValue" /> if no limit was advertised.</summary>
+    public int MaxChannels { get; }
+    /// <summary>Valid channel prefix characters.</summary>
+    public string ChannelTypes { get; }
+    /// <summary>Raw CHANMODES value, or <c>null</c> if it was not advertised.</summary>
+    public string? ChannelModes { get; }
+    /// <summary>Channel mode characters from the parsed PREFIX value.</summary>
+    public string ChannelModePrefixModes { get; }
+    /// <summary>Display prefix characters from the parsed PREFIX value.</summary>
+    public string ChannelModePrefixPrefixes { get; }
+    /// <summary>Server case-mapping rule for nick and channel comparisons.</summary>
+    public CaseMappingType CaseMapping { get; }
+    /// <summary>Capabilities advertised via the ISUPPORT CAPAB parameter.</summary>
+    public IReadOnlyList<string> SupportedCapabilities { get; }
+
+    /// <summary>
+    /// Initializes a new <see cref="IsupportReceivedEvent" /> from the parsed ISUPPORT state.
+    /// </summary>
+    /// <param name="message">The raw IRC message.</param>
+    /// <param name="parser">The parser containing the latest ISUPPORT state.</param>
+    public IsupportReceivedEvent(IrcMessage message, IsupportParser parser)
+        : base(message)
+    {
+        ArgumentNullException.ThrowIfNull(parser);
+
+        Features = new ReadOnlyDictionary<string, string?>(new Dictionary<string, string?>(parser.Features, StringComparer.OrdinalIgnoreCase));
+        NetworkName = parser.NetworkName;
+        MaxNicknameLength = parser.MaxNicknameLength;
+        MaxChannelLength = parser.MaxChannelLength;
+        MaxTopicLength = parser.MaxTopicLength;
+        MaxKickLength = parser.MaxKickLength;
+        MaxAwayLength = parser.MaxAwayLength;
+        MaxTargets = parser.MaxTargets;
+        MaxChannels = parser.MaxChannels;
+        ChannelTypes = parser.ChannelTypes;
+        ChannelModes = parser.ChannelModes;
+        var channelModePrefix = parser.ChannelModePrefix;
+        ChannelModePrefixModes = channelModePrefix.Modes;
+        ChannelModePrefixPrefixes = channelModePrefix.Prefixes;
+        CaseMapping = parser.CaseMapping;
+        SupportedCapabilities = Array.AsReadOnly(parser.SupportedCapabilities.ToArray());
     }
 }
 

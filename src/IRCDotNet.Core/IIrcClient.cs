@@ -210,6 +210,8 @@ public interface IIrcClient : IDisposable, IAsyncDisposable
     event EventHandler<Events.ChannelUsersEvent>? ChannelUsersReceived;
     /// <summary>Raised for every raw IRC message received.</summary>
     event EventHandler<Events.RawMessageEvent>? RawMessageReceived;
+    /// <summary>Raised after an ISUPPORT reply has been parsed into server feature state.</summary>
+    event EventHandler<Events.IsupportReceivedEvent>? IsupportReceived;
     /// <summary>Raised when a channel join attempt fails.</summary>
     event EventHandler<Events.ChannelJoinFailedEvent>? ChannelJoinFailed;
     /// <summary>Raised when IRCv3 capability negotiation completes.</summary>

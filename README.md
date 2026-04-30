@@ -20,7 +20,7 @@ dotnet add package IRCDotNet.Core
 - **Rate Limiting** — Configurable token-bucket algorithm prevents flood protection kicks
 - **Auto-Reconnect** — Exponential backoff with automatic channel rejoin
 - **Thread-Safe** — `ConcurrentDictionary`, `ConcurrentHashSet`, semaphore-controlled sends, volatile state
-- **Event-Driven** — 40 event types with threaded, sequential, or background dispatch strategies
+- **Event-Driven** — 41 event types with threaded, sequential, or background dispatch strategies
 - **Fluent Builder** — `IrcClientOptionsBuilder` for type-safe configuration
 - **Dependency Injection** — `IServiceCollection` integration with `AddIrcClient()` and `AddIrcBotManager()`
 - **Multi-Client Management** — `IrcBotManager` as an `IHostedService` for managing multiple connections
@@ -131,7 +131,7 @@ services.AddIrcBotManager(manager =>
 | Messages | `PrivateMessageReceived`, `NoticeReceived`, `MessageTagsReceived`, `TypingIndicatorReceived` |
 | Channels | `UserJoinedChannel`, `ExtendedUserJoinedChannel`, `UserLeftChannel`, `UserKicked`, `TopicChanged`, `ChannelUsersReceived`, `ChannelJoinFailed`, `ChannelModeIsReceived`, `ChannelListReceived`, `ChannelListEndReceived`, `InviteReceived` |
 | Users | `NickChanged`, `NicknameCollision`, `UserQuit`, `UserAwayStatusChanged`, `OwnAwayStatusChanged`, `UserAccountChanged`, `UserHostnameChanged` |
-| Server | `MotdReceived` |
+| Server | `MotdReceived`, `IsupportReceived` |
 | Errors | `ErrorReplyReceived` — general catch-all for any IRC error numeric (482, 442, 461, etc.) |
 | Advanced | `RawMessageReceived`, `BatchReceived`, `WhoReceived`, `WhoWasReceived` |
 | CTCP | `CtcpRequestReceived`, `CtcpReplyReceived`, `CtcpActionReceived` |
@@ -311,6 +311,10 @@ client.Connected += (s, e) =>
     bool same = client.NicknamesEqual("MyApp", "myapp"); // true
 };
 ```
+
+For event-driven consumers, `IsupportReceived` fires after each `005` reply has
+been parsed and carries a stable snapshot of the current ISUPPORT state,
+including `CASEMAPPING`, advertised limits, channel prefixes, and feature tokens.
 
 ### Validate Input Before Sending
 

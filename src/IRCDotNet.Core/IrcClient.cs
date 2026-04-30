@@ -172,6 +172,8 @@ public class IrcClient : IIrcClient
     public event EventHandler<ChannelUsersEvent>? ChannelUsersReceived;
     /// <summary>Raised for every raw IRC message received from the server.</summary>
     public event EventHandler<RawMessageEvent>? RawMessageReceived;
+    /// <summary>Raised after an ISUPPORT reply has been parsed into server feature state.</summary>
+    public event EventHandler<IsupportReceivedEvent>? IsupportReceived;
     /// <summary>Raised when a channel join attempt fails (banned, invite-only, etc.).</summary>
     public event EventHandler<ChannelJoinFailedEvent>? ChannelJoinFailed;
 
@@ -2975,6 +2977,7 @@ public class IrcClient : IIrcClient
         {
             // Use the enhanced IsupportParser instead of basic parsing
             _isupportParser.ParseIsupport(message);
+            RaiseEventAsync(IsupportReceived, new IsupportReceivedEvent(message, _isupportParser));
 
             // Log the parsed network information
             if (!string.IsNullOrEmpty(_isupportParser.NetworkName))

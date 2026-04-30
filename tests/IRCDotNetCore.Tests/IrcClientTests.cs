@@ -191,6 +191,7 @@ public class IrcClientTests : IDisposable
         _client.NickChanged += (sender, e) => { };
         _client.ChannelUsersReceived += (sender, e) => { };
         _client.RawMessageReceived += (sender, e) => { };
+        _client.IsupportReceived += (sender, e) => { };
 
         // If we got here without compilation errors, the test passes
         true.Should().BeTrue();
@@ -237,6 +238,46 @@ public class IrcClientTests : IDisposable
         {
             observedMessages.Should().Equal("first", "second");
         }
+    }
+
+    [Fact]
+    public async Task ProcessMessageAsync_WhenIsupportReceived_ShouldRaiseTypedEventAfterParsing()
+    {
+        var observed = new TaskCompletionSource<IsupportReceivedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        CaseMappingType mappingObservedByHandler = default;
+        _client.IsupportReceived += (_, args) =>
+        {
+            mappingObservedByHandler = _client.GetServerCaseMapping();
+            observed.TrySetResult(args);
+        };
+
+        var message = CreateMessage("005", "testbot", "NETWORK=ExampleNet", "NICKLEN=32", "CHANTYPES=#&", "PREFIX=(ov)@+", "CASEMAPPING=ascii", "CAPAB=echo-message", "are supported by this server");
+
+        await InvokePrivateMethodAsync(_client, "ProcessMessageAsync", message);
+
+        var args = await observed.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        args.Message.Should().BeSameAs(message);
+        args.NetworkName.Should().Be("ExampleNet");
+        args.MaxNicknameLength.Should().Be(32);
+        args.ChannelTypes.Should().Be("#&");
+        args.ChannelModePrefixModes.Should().Be("ov");
+        args.ChannelModePrefixPrefixes.Should().Be("@+");
+        args.Features.Should().ContainKey("CASEMAPPING");
+        args.CaseMapping.Should().Be(CaseMappingType.Ascii);
+        mappingObservedByHandler.Should().Be(CaseMappingType.Ascii);
+        args.SupportedCapabilities.Should().Contain("echo-message");
+    }
+
+    [Fact]
+    public async Task ProcessMessageAsync_WhenMessageIsNotIsupport_ShouldNotRaiseTypedIsupportEvent()
+    {
+        var observed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _client.IsupportReceived += (_, _) => observed.TrySetResult();
+
+        await InvokePrivateMethodAsync(_client, "ProcessMessageAsync", CreateMessage("001", "testbot", "Welcome"));
+
+        var completed = await Task.WhenAny(observed.Task, Task.Delay(150));
+        completed.Should().NotBe(observed.Task);
     }
 
     [Fact]
@@ -538,6 +579,17 @@ public class IrcClientTests : IDisposable
             "host.test",
             "#room",
             text);
+    }
+
+    private static IrcMessage CreateMessage(string command, params string[] parameters)
+    {
+        var message = new IrcMessage { Command = command };
+        foreach (var parameter in parameters)
+        {
+            message.Parameters.Add(parameter);
+        }
+
+        return message;
     }
 
     private sealed class BlockingTransport : IRCDotNet.Core.Transport.IIrcTransport
