@@ -144,7 +144,7 @@ public class PrivateMessageEvent : IrcEvent
     /// <summary>The message text.</summary>
     public string Text { get; }
     /// <summary>Whether this message was sent to a channel (vs. a private message).</summary>
-    public bool IsChannelMessage => Target.StartsWith('#') || Target.StartsWith('&');
+    public bool IsChannelMessage => Target.StartsWith('#') || Target.StartsWith('&') || Target.StartsWith('+') || Target.StartsWith('!');
     /// <summary>Whether this message is an echo of the client's own message (requires echo-message capability).</summary>
     public bool IsEcho { get; }
 
@@ -185,6 +185,8 @@ public class NoticeEvent : IrcEvent
     public string Target { get; }
     /// <summary>The notice text.</summary>
     public string Text { get; }
+    /// <summary>Whether this notice is an echo of the client's own notice.</summary>
+    public bool IsEcho { get; }
 
     /// <summary>
     /// Initializes a new <see cref="NoticeEvent"/>.
@@ -195,7 +197,8 @@ public class NoticeEvent : IrcEvent
     /// <param name="host">Hostname of the sender.</param>
     /// <param name="target">Target of the notice.</param>
     /// <param name="text">The notice text.</param>
-    public NoticeEvent(IrcMessage message, string nick, string user, string host, string target, string text)
+    /// <param name="isEcho">Whether this is an echo of the client's own notice.</param>
+    public NoticeEvent(IrcMessage message, string nick, string user, string host, string target, string text, bool isEcho = false)
         : base(message)
     {
         Nick = nick;
@@ -203,6 +206,7 @@ public class NoticeEvent : IrcEvent
         Host = host;
         Target = target;
         Text = text;
+        IsEcho = isEcho;
     }
 }
 
@@ -482,7 +486,7 @@ public class ChannelJoinFailedEvent : IrcEvent
 }
 
 /// <summary>
-/// Event raised when IRCv3 capabilities are negotiated.
+/// Event raised when IRCv3 capabilities are negotiated or updated by the server.
 /// </summary>
 public class CapabilitiesNegotiatedEvent : IrcEvent
 {
@@ -1045,7 +1049,9 @@ public class CtcpActionEvent : IrcEvent
     /// <summary>The action text (e.g. <c>"waves hello"</c> from <c>/me waves hello</c>).</summary>
     public string ActionText { get; }
     /// <summary>Whether this action was performed in a channel (vs. a private message).</summary>
-    public bool IsChannelAction => Target.StartsWith('#') || Target.StartsWith('&');
+    public bool IsChannelAction => Target.StartsWith('#') || Target.StartsWith('&') || Target.StartsWith('+') || Target.StartsWith('!');
+    /// <summary>Whether this action is an echo of the client's own action.</summary>
+    public bool IsEcho { get; }
 
     /// <summary>
     /// Initializes a new <see cref="CtcpActionEvent"/>.
@@ -1056,7 +1062,8 @@ public class CtcpActionEvent : IrcEvent
     /// <param name="host">Hostname of the user.</param>
     /// <param name="target">Where the action was performed.</param>
     /// <param name="actionText">The action text.</param>
-    public CtcpActionEvent(IrcMessage message, string nick, string user, string host, string target, string actionText)
+    /// <param name="isEcho">Whether this is an echo of the client's own action.</param>
+    public CtcpActionEvent(IrcMessage message, string nick, string user, string host, string target, string actionText, bool isEcho = false)
         : base(message)
     {
         Nick = nick;
@@ -1064,6 +1071,7 @@ public class CtcpActionEvent : IrcEvent
         Host = host;
         Target = target;
         ActionText = actionText;
+        IsEcho = isEcho;
     }
 }
 

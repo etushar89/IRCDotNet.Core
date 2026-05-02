@@ -214,7 +214,7 @@ public interface IIrcClient : IDisposable, IAsyncDisposable
     event EventHandler<Events.IsupportReceivedEvent>? IsupportReceived;
     /// <summary>Raised when a channel join attempt fails.</summary>
     event EventHandler<Events.ChannelJoinFailedEvent>? ChannelJoinFailed;
-    /// <summary>Raised when IRCv3 capability negotiation completes.</summary>
+    /// <summary>Raised when IRCv3 capability state is negotiated or updated by the server.</summary>
     event EventHandler<Events.CapabilitiesNegotiatedEvent>? CapabilitiesNegotiated;
     /// <summary>Raised when a user's away status changes.</summary>
     event EventHandler<Events.UserAwayStatusChangedEvent>? UserAwayStatusChanged;

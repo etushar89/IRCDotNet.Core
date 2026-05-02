@@ -281,6 +281,24 @@ public class IrcClientTests : IDisposable
     }
 
     [Fact]
+    public async Task ProcessMessageAsync_WhenCapabilityDeleted_ShouldRaiseCapabilitySnapshotWithoutDeletedCapability()
+    {
+        var supportedCapabilities = GetCapabilitySet(_client, "_supportedCapabilities");
+        var enabledCapabilities = GetCapabilitySet(_client, "_enabledCapabilities");
+        supportedCapabilities.Add("echo-message");
+        enabledCapabilities.Add("echo-message");
+        var observed = new TaskCompletionSource<CapabilitiesNegotiatedEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _client.CapabilitiesNegotiated += (_, args) => observed.TrySetResult(args);
+
+        await InvokePrivateMethodAsync(_client, "ProcessMessageAsync", CreateMessage("CAP", "*", "DEL", "echo-message"));
+
+        var args = await observed.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        args.EnabledCapabilities.Should().NotContain("echo-message");
+        args.SupportedCapabilities.Should().NotContain("echo-message");
+        _client.EnabledCapabilities.Should().NotContain("echo-message");
+    }
+
+    [Fact]
     public async Task SendMessageAsync_WhenConcurrentCallsTargetSameClient_ShouldSerializeTransportWrites()
     {
         var transport = new BlockingTransport();
@@ -553,6 +571,13 @@ public class IrcClientTests : IDisposable
         {
             await task.ConfigureAwait(false);
         }
+    }
+
+    private static ISet<string> GetCapabilitySet(IrcClient client, string fieldName)
+    {
+        var field = typeof(IrcClient).GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic);
+        field.Should().NotBeNull();
+        return field!.GetValue(client).Should().BeAssignableTo<ISet<string>>().Subject;
     }
 
     private static async Task WaitForConditionAsync(Func<bool> predicate, TimeSpan timeout)

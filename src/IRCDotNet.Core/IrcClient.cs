@@ -1403,25 +1403,41 @@ public class IrcClient : IIrcClient
         if (message.Parameters.Count < 3) return;
 
         var capabilities = message.Parameters[2].Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var capabilityStateChanged = false;
         foreach (var cap in capabilities)
         {
-            _supportedCapabilities.Remove(cap);
-            _enabledCapabilities.Remove(cap);
-            InvalidateCapabilitiesCache();
+            var removedSupported = _supportedCapabilities.Remove(cap);
+            var removedEnabled = _enabledCapabilities.Remove(cap);
+            if (removedSupported || removedEnabled)
+            {
+                capabilityStateChanged = true;
+                InvalidateCapabilitiesCache();
+            }
 
             if (_options.VerboseCapabilityNegotiation)
                 _logger?.LogDebug("Capability removed: {Capability}", cap);
         }
+
+        if (capabilityStateChanged)
+        {
+            RaiseCapabilitiesNegotiatedSnapshot(message);
+        }
     }
+
     private async Task EndCapabilityNegotiationAsync()
     {
-        await SendRawAsync("CAP END").ConfigureAwait(false);        // Raise capabilities negotiated event
-        RaiseEventAsync(CapabilitiesNegotiated, new CapabilitiesNegotiatedEvent(
-            new IrcMessage { Command = IrcCommands.CAP }, _enabledCapabilities.ToHashSet(), _supportedCapabilities.ToHashSet()));
+        await SendRawAsync("CAP END").ConfigureAwait(false);
+        RaiseCapabilitiesNegotiatedSnapshot();
 
         if (_options.VerboseCapabilityNegotiation)
             _logger?.LogInformation("Capability negotiation complete. Enabled: {Capabilities}",
                 string.Join(", ", _enabledCapabilities));
+    }
+
+    private void RaiseCapabilitiesNegotiatedSnapshot(IrcMessage? message = null)
+    {
+        RaiseEventAsync(CapabilitiesNegotiated, new CapabilitiesNegotiatedEvent(
+            message ?? new IrcMessage { Command = IrcCommands.CAP }, _enabledCapabilities.ToHashSet(), _supportedCapabilities.ToHashSet()));
     }
 
     private async Task StartSaslAuthenticationAsync()
@@ -1761,11 +1777,8 @@ public class IrcClient : IIrcClient
         // Tolerate missing trailing \x01 (some clients/bouncers omit it).
         if (text.Length >= 2 && text[0] == '\u0001')
         {
-            // Skip echoed CTCP — we sent this request ourselves, don't process or auto-reply
-            if (isEcho) return;
-
             var ctcpContent = text[^1] == '\u0001' ? text[1..^1] : text[1..];
-            HandleCtcpRequest(message, nick, user, host, target, ctcpContent);
+            HandleCtcpRequest(message, nick, user, host, target, ctcpContent, isEcho);
             return; // CTCP messages are not regular PRIVMSGs
         }
 
@@ -1820,7 +1833,7 @@ public class IrcClient : IIrcClient
             }, "NickServIdentify");
         }
 
-        RaiseEventAsync(NoticeReceived, new NoticeEvent(message, nick, user, host, target, text));
+        RaiseEventAsync(NoticeReceived, new NoticeEvent(message, nick, user, host, target, text, isEchoNotice));
     }
 
     private void HandleNickChange(IrcMessage message)
@@ -2699,7 +2712,7 @@ public class IrcClient : IIrcClient
         }
     }
 
-    private void HandleCtcpRequest(IrcMessage message, string nick, string user, string host, string target, string ctcpContent)
+    private void HandleCtcpRequest(IrcMessage message, string nick, string user, string host, string target, string ctcpContent, bool isEcho = false)
     {
         // Parse "COMMAND params" from the content between \x01 delimiters
         var spaceIndex = ctcpContent.IndexOf(' ');
@@ -2712,7 +2725,12 @@ public class IrcClient : IIrcClient
         // ACTION is special — it's displayed as "* nick action-text", not as a CTCP dialog
         if (command == "ACTION")
         {
-            RaiseEventAsync(CtcpActionReceived, new CtcpActionEvent(message, nick, user, host, target, parameters));
+            RaiseEventAsync(CtcpActionReceived, new CtcpActionEvent(message, nick, user, host, target, parameters, isEcho));
+            return;
+        }
+
+        if (isEcho)
+        {
             return;
         }
 
@@ -3021,6 +3039,9 @@ public class IrcClient : IIrcClient
             case IrcNumericReplies.ERR_NOMOTD:
                 _logger?.LogDebug("No MOTD available");
                 _motdBuffer = null;
+                var noMotdTarget = message.Parameters.Count > 0 ? message.Parameters[0] : _currentNick;
+                var noMotdReason = message.Parameters.Count > 1 ? message.Parameters[1] : "No MOTD available";
+                RaiseEventAsync(ErrorReplyReceived, new ErrorReplyEvent(message, message.Command, noMotdTarget, noMotdReason));
                 break;
         }
     }

@@ -137,6 +137,8 @@ services.AddIrcBotManager(manager =>
 | CTCP | `CtcpRequestReceived`, `CtcpReplyReceived`, `CtcpActionReceived` |
 | Enhanced | `OnEnhancedMessage`, `OnEnhancedConnected`, `OnEnhancedDisconnected`, `OnEnhancedUserJoined`, `OnGenericMessage`, `OnPreSendMessage` |
 
+`CapabilitiesNegotiated` emits a current capability snapshot after initial negotiation and after server-side capability updates such as `CAP DEL`.
+
 ## Usage Examples
 
 ### Logging
