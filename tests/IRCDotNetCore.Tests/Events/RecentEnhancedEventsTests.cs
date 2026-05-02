@@ -1,3 +1,4 @@
+using System.Globalization;
 using FluentAssertions;
 using IRCDotNet.Core.Events;
 using IRCDotNet.Core.Protocol;
@@ -126,6 +127,40 @@ public class RecentEnhancedEventsTests
         eventArgs.Tags.Should().ContainKey("msgid");
         eventArgs.ServerTime.Should().HaveValue();
         eventArgs.MessageId.Should().Be("123");
+    }
+
+    [Fact]
+    public void NEW001_IrcEventTimestamp_WhenServerTimeTagPresent_ShouldUseServerTimestamp()
+    {
+        var serverTime = DateTimeOffset.Parse("2023-01-01T12:00:00.123Z");
+        var message = IrcMessage.Parse("@time=2023-01-01T12:00:00.123Z :nick!user@host PRIVMSG #channel :Hello");
+
+        var eventArgs = new PrivateMessageEvent(message, "nick", "user", "host", "#channel", "Hello");
+
+        eventArgs.Timestamp.Should().Be(serverTime);
+    }
+
+    [Fact]
+    public void NEW001_IrcEventTimestamp_WhenCurrentCultureIsNonGregorian_ShouldUseServerTimestamp()
+    {
+        var originalCulture = CultureInfo.CurrentCulture;
+        var originalUiCulture = CultureInfo.CurrentUICulture;
+        var serverTime = DateTimeOffset.Parse("2023-01-01T12:00:00.123Z", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
+        try
+        {
+            CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo("ar-SA");
+            CultureInfo.CurrentUICulture = CultureInfo.GetCultureInfo("ar-SA");
+            var message = IrcMessage.Parse("@time=2023-01-01T12:00:00.123Z :nick!user@host PRIVMSG #channel :Hello");
+
+            var eventArgs = new PrivateMessageEvent(message, "nick", "user", "host", "#channel", "Hello");
+
+            eventArgs.Timestamp.Should().Be(serverTime);
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = originalCulture;
+            CultureInfo.CurrentUICulture = originalUiCulture;
+        }
     }
 
     [Fact]

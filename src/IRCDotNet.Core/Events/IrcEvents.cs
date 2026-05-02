@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Globalization;
 using IRCDotNet.Core.Protocol;
 
 namespace IRCDotNet.Core.Events;
@@ -16,7 +17,7 @@ public abstract class IrcEvent
     /// <summary>
     /// Timestamp when the event occurred.
     /// </summary>
-    public DateTimeOffset Timestamp { get; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset Timestamp { get; }
 
     /// <summary>
     /// Initializes the event from the raw IRC message.
@@ -25,6 +26,19 @@ public abstract class IrcEvent
     protected IrcEvent(IrcMessage message)
     {
         Message = message;
+        Timestamp = GetTimestamp(message);
+    }
+
+    private static DateTimeOffset GetTimestamp(IrcMessage message)
+    {
+        if (message.Tags.TryGetValue("time", out var timeValue)
+            && !string.IsNullOrEmpty(timeValue)
+            && DateTimeOffset.TryParse(timeValue, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var serverTime))
+        {
+            return serverTime;
+        }
+
+        return DateTimeOffset.UtcNow;
     }
 }
 

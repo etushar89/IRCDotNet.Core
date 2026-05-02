@@ -2610,16 +2610,6 @@ public class IrcClient : IIrcClient
     {        // Fire message tags event for interested listeners
         RaiseEventAsync(MessageTagsReceived, new MessageTagsEvent(message));
 
-        // Process server-time tag
-        if (message.Tags.TryGetValue(MessageTags.TIME, out var timeValue) && !string.IsNullOrEmpty(timeValue))
-        {
-            if (DateTimeOffset.TryParse(timeValue, out var serverTime))
-            {
-                // Update message timestamp if server-time is available
-                // This could be used for proper message ordering
-            }
-        }
-
         // Process account tag for account-notify
         if (message.Tags.TryGetValue(MessageTags.ACCOUNT, out var account) && !string.IsNullOrEmpty(message.Source))
         {
