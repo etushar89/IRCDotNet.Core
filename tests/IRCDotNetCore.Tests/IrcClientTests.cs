@@ -269,6 +269,78 @@ public class IrcClientTests : IDisposable
     }
 
     [Fact]
+    public async Task ProcessMessageAsync_WhenNicknameInUseReceivedDuringRegistrationWithNoAlternativeNicks_ShouldSendTimestampNickRetry()
+    {
+        // Repro for the production "stuck on Connecting" symptom: when the server replies 433
+        // ERR_NICKNAMEINUSE during pre-registration AND the client has no AlternativeNicks
+        // configured, the handler previously did nothing — leaving the session stuck in CAP
+        // limbo with no nick accepted. Contract: Core must send a NICK retry with a uniquified
+        // fallback in this case so registration can complete (or be rejected for another reason).
+        _client.CurrentNick.Should().Be("testbot");
+        _options.AlternativeNicks.Should().BeEmpty();
+
+        var transport = new BlockingTransport();
+        transport.AllowFirstWriteToComplete();
+        SetPrivateField(_client, "_transport", transport);
+        SetPrivateField(_client, "_isConnected", true);
+        SetPrivateField(_client, "_currentNick", "testbot");
+        GetPrivateField<bool>(_client, "_isRegistered").Should().BeFalse();
+
+        await InvokePrivateMethodAsync(
+            _client,
+            "ProcessMessageAsync",
+            IrcMessage.Parse(":server 433 * testbot :Nickname is already in use."));
+
+        await WaitForConditionAsync(
+            () => transport.WrittenLines.Any(line => line.StartsWith("NICK ", StringComparison.Ordinal)),
+            TimeSpan.FromSeconds(2));
+
+        var nickRetry = transport.WrittenLines.Single(line => line.StartsWith("NICK ", StringComparison.Ordinal));
+        nickRetry.Should().StartWith("NICK testbot");
+        nickRetry.Should().NotBe("NICK testbot");
+        _client.CurrentNick.Should().NotBe("testbot");
+        _client.CurrentNick.Should().StartWith("testbot");
+    }
+
+    [Fact]
+    public async Task ProcessMessageAsync_WhenNicknameInUseReceivedDuringRegistrationWithAlternativeNicks_ShouldSendNextAlternative()
+    {
+        // Regression guard: pre-existing AlternativeNicks behavior must remain intact when we
+        // add the empty-AlternativeNicks fallback. With the current nick at index 0 of the
+        // alternatives list, the handler must advance to index 1.
+        using var client = new IrcClient(
+            new IrcClientOptions
+            {
+                Server = "irc.example.com",
+                Port = 6667,
+                Nick = "testbot",
+                UserName = "testuser",
+                RealName = "Test Bot",
+                UseSsl = false,
+                AlternativeNicks = new List<string> { "testbot_", "testbot__" }
+            },
+            NullLogger<IrcClient>.Instance);
+
+        var transport = new BlockingTransport();
+        transport.AllowFirstWriteToComplete();
+        SetPrivateField(client, "_transport", transport);
+        SetPrivateField(client, "_isConnected", true);
+        SetPrivateField(client, "_currentNick", "testbot_");
+
+        await InvokePrivateMethodAsync(
+            client,
+            "ProcessMessageAsync",
+            IrcMessage.Parse(":server 433 * testbot_ :Nickname is already in use."));
+
+        await WaitForConditionAsync(
+            () => transport.WrittenLines.Any(line => line.StartsWith("NICK ", StringComparison.Ordinal)),
+            TimeSpan.FromSeconds(2));
+
+        transport.WrittenLines.Should().ContainSingle().Which.Should().Be("NICK testbot__");
+        client.CurrentNick.Should().Be("testbot__");
+    }
+
+    [Fact]
     public async Task ProcessMessageAsync_WhenMessageIsNotIsupport_ShouldNotRaiseTypedIsupportEvent()
     {
         var observed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);

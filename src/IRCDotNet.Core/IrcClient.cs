@@ -2074,23 +2074,32 @@ public class IrcClient : IIrcClient
 
     private async Task HandleNicknameInUseAsync(IrcMessage message)
     {
-        if (!_isRegistered && _options.AlternativeNicks.Count > 0)
+        // Pre-registration only: once registered, the server-side nick is authoritative and a
+        // 433 reply is a no-op from the client's perspective.
+        if (_isRegistered)
         {
-            // Use more efficient IndexOf on the list directly
+            return;
+        }
+
+        // If alternative nicks are configured and the current nick is still inside that list,
+        // advance to the next entry. Otherwise (no alternatives, or alternatives exhausted),
+        // fall through to a timestamp-suffixed fallback so registration can still complete —
+        // without this fallback the session would stall in CAP limbo forever waiting for a
+        // 001 RPL_WELCOME that the server will never send.
+        if (_options.AlternativeNicks.Count > 0)
+        {
             var currentIndex = _options.AlternativeNicks.IndexOf(_currentNick);
             if (currentIndex >= 0 && currentIndex < _options.AlternativeNicks.Count - 1)
             {
                 _currentNick = _options.AlternativeNicks[currentIndex + 1];
                 await SendRawAsync($"NICK {_currentNick}").ConfigureAwait(false);
-            }
-            else
-            {
-                // All alternative nicks exhausted, try adding a timestamp-based suffix for uniqueness
-                var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds() % 10000;
-                _currentNick = $"{_options.Nick}{timestamp}";
-                await SendRawAsync($"NICK {_currentNick}").ConfigureAwait(false);
+                return;
             }
         }
+
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds() % 10000;
+        _currentNick = $"{_options.Nick}{timestamp}";
+        await SendRawAsync($"NICK {_currentNick}").ConfigureAwait(false);
     }
 
     private async Task HandleNicknameCollisionAsync(IrcMessage message)
