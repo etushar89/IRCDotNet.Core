@@ -2097,8 +2097,14 @@ public class IrcClient : IIrcClient
             }
         }
 
-        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds() % 10000;
-        _currentNick = $"{_options.Nick}{timestamp}";
+        // Millisecond-precision suffix (4 decimal digits) so a back-to-back 433 round-trip
+        // produces a different fallback nick rather than the same one — the original
+        // ToUnixTimeSeconds() formulation could re-emit the identical NICK within one second
+        // and risk a server-side flood disconnect. Length is preserved at 4 digits to keep
+        // total nick length under typical 16/30-char network caps.
+        var suffix = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() % 10000;
+        _currentNick = $"{_options.Nick}{suffix:D4}";
+        _logger?.LogInformation("Sent NICK retry '{Nick}' after 433 with no usable alternatives", _currentNick);
         await SendRawAsync($"NICK {_currentNick}").ConfigureAwait(false);
     }
 

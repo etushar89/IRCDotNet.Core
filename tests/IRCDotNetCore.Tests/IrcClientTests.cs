@@ -300,6 +300,17 @@ public class IrcClientTests : IDisposable
         nickRetry.Should().NotBe("NICK testbot");
         _client.CurrentNick.Should().NotBe("testbot");
         _client.CurrentNick.Should().StartWith("testbot");
+
+        // Pin the suffix shape: exactly 4 decimal digits zero-padded (millisecond-precision
+        // modulo 10000). Total nick length stays under typical 16/30-char network caps
+        // regardless of the network's clock value, and the consistent 4-digit shape means a
+        // back-to-back 433 within the same second cannot emit an identical NICK retry — the
+        // pre-fix formulation used ToUnixTimeSeconds() % 10000 which could re-emit the same
+        // suffix within a second-long server retry window.
+        var fallback = _client.CurrentNick;
+        var suffix = fallback["testbot".Length..];
+        suffix.Should().HaveLength(4);
+        suffix.Should().MatchRegex("^[0-9]{4}$");
     }
 
     [Fact]
