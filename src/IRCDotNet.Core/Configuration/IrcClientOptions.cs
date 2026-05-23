@@ -1,5 +1,3 @@
-using IRCDotNet.Core.Protocol;
-
 namespace IRCDotNet.Core.Configuration;
 
 /// <summary>

@@ -1,4 +1,3 @@
-using IRCDotNet.Core;
 using IRCDotNet.Core.Configuration;
 using IRCDotNet.Core.Events;
 using IRCDotNet.Core.Extensions;

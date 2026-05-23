@@ -1,5 +1,4 @@
 using System.Text;
-using IRCDotNet.Core.Configuration;
 
 namespace IRCDotNet.Core.Configuration;
 
