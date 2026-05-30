@@ -573,6 +573,17 @@ public class IrcClient : IIrcClient
         {
             await _sendLock.WaitAsync(combinedCts.Token).ConfigureAwait(false);
         }
+        catch (ObjectDisposedException)
+        {
+            // VPN-triggered disposal race: a concurrent Dispose has torn down
+            // _sendLock while this in-flight send was past the _isConnected
+            // check. The client is being torn down; the send was unobservable
+            // to the user. Surface as "Not connected" so callers (the adapter)
+            // route through the normal disconnected path instead of leaking
+            // "Cannot access a disposed object. Object name:
+            // 'System.Threading.SemaphoreSlim'" into UI surfaces.
+            throw new InvalidOperationException("Not connected");
+        }
         catch (OperationCanceledException) when (!_isConnected)
         {
             throw new InvalidOperationException("Not connected");
@@ -601,7 +612,8 @@ public class IrcClient : IIrcClient
         }
         finally
         {
-            _sendLock.Release();
+            // See the SendRawWithCancellationAsync companion below for the disposal-race rationale.
+            try { _sendLock.Release(); } catch (ObjectDisposedException) { }
         }
     }
 
@@ -661,6 +673,14 @@ public class IrcClient : IIrcClient
         {
             await _sendLock.WaitAsync(combinedCts.Token).ConfigureAwait(false);
         }
+        catch (ObjectDisposedException)
+        {
+            // VPN-triggered disposal race (see SendRawAsync for context):
+            // _sendLock was disposed while this in-flight send was past the
+            // _isConnected check. Surface as "Not connected" so the leak
+            // never reaches the caller.
+            throw new InvalidOperationException("Not connected");
+        }
         catch (OperationCanceledException)
         {
             // Don't attempt another wait if we couldn't acquire the lock
@@ -685,7 +705,11 @@ public class IrcClient : IIrcClient
         }
         finally
         {
-            _sendLock.Release();
+            // Guard against the same VPN-triggered disposal race: a concurrent
+            // Dispose can tear down _sendLock between our WaitAsync acquire
+            // and this Release. Release on a disposed semaphore throws ODE
+            // and would leak through the user-facing send path.
+            try { _sendLock.Release(); } catch (ObjectDisposedException) { }
         }
     }
 
