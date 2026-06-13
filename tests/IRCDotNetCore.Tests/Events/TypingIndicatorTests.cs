@@ -65,6 +65,35 @@ public class TypingIndicatorTests
     }
 
     [Theory]
+    [InlineData("#channel")]
+    [InlineData("&local")]
+    [InlineData("+modeless")]
+    [InlineData("!ABCDEchannel")]
+    public void TypingIndicatorEvent_RfcChannelPrefix_IsChannelTyping_ShouldBeTrue(string target)
+    {
+        // RFC 2811/2812 + ISUPPORT default CHANTYPES = "#&+!". Typing on a '+' (modeless)
+        // or '!' (safe) channel must be reported as channel typing, otherwise the client
+        // misroutes it into a private-message conversation keyed by the sender's nick.
+        var message = IrcMessage.Parse($"@+typing=active :nick!user@host TAGMSG {target}");
+
+        var eventArgs = new TypingIndicatorEvent(message, "nick", "user", "host", target, TypingState.Active);
+
+        eventArgs.IsChannelTyping.Should().BeTrue();
+    }
+
+    [Theory]
+    [InlineData("someNick")]
+    [InlineData("Alice")]
+    public void TypingIndicatorEvent_NickTarget_IsChannelTyping_ShouldBeFalse(string target)
+    {
+        var message = IrcMessage.Parse($"@+typing=active :nick!user@host TAGMSG {target}");
+
+        var eventArgs = new TypingIndicatorEvent(message, "nick", "user", "host", target, TypingState.Active);
+
+        eventArgs.IsChannelTyping.Should().BeFalse();
+    }
+
+    [Theory]
     [InlineData("active", TypingState.Active)]
     [InlineData("paused", TypingState.Paused)]
     [InlineData("done", TypingState.Done)]

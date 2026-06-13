@@ -1227,8 +1227,12 @@ public class TypingIndicatorEvent : IrcEvent
     public string Target { get; }
     /// <summary>The typing state: <see cref="TypingState.Active"/>, <see cref="TypingState.Paused"/>, or <see cref="TypingState.Done"/>.</summary>
     public TypingState State { get; }
-    /// <summary>Whether this typing notification is for a channel (vs. a private message).</summary>
-    public bool IsChannelTyping => Target.StartsWith('#') || Target.StartsWith('&');
+    /// <summary>
+    /// Whether this typing notification is for a channel (vs. a private message).
+    /// Recognizes the RFC 2811 / ISUPPORT default CHANTYPES prefixes (<c>#</c>, <c>&amp;</c>, <c>+</c>, <c>!</c>);
+    /// otherwise the target is treated as a private-message conversation keyed by nickname.
+    /// </summary>
+    public bool IsChannelTyping => Target.Length > 0 && Target[0] is '#' or '&' or '+' or '!';
 
     /// <summary>
     /// Initializes a new <see cref="TypingIndicatorEvent"/>.
