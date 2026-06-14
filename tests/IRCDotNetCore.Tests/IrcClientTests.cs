@@ -382,6 +382,99 @@ public class IrcClientTests : IDisposable
     }
 
     [Fact]
+    public async Task ProcessMessageAsync_WhenServerPingArrivesWhileSendBucketExhausted_ShouldSendPongWithoutRateLimitDelay()
+    {
+        // Regression guard (keepalive starvation): the PONG response to a server PING is
+        // protocol-critical liveness traffic and MUST NOT be throttled by the user-message
+        // rate limiter. The PONG and user PRIVMSGs previously shared the single "send" token
+        // bucket, so a saturated bucket (heavy outbound — e.g. a ~10-line message sent many
+        // times, or a bulk PM fan-out) starved the PONG. The peer/our watchdog then saw no
+        // liveness and dropped + reconnected the connection mid-conversation.
+        using var client = new IrcClient(
+            new IrcClientOptions
+            {
+                Server = "irc.example.com",
+                Port = 6667,
+                Nick = "testbot",
+                UserName = "testuser",
+                RealName = "Test Bot",
+                UseSsl = false,
+                EnableRateLimit = true,
+                // Empty bucket that effectively never refills: a *rate-limited* send would park
+                // on the limiter for ~1000s (1 token / 1000s), far beyond this test's window.
+                RateLimitConfig = new RateLimitConfig(refillRate: 0.001, bucketSize: 1, initialTokens: 0)
+            },
+            NullLogger<IrcClient>.Instance);
+
+        var transport = new BlockingTransport();
+        transport.AllowFirstWriteToComplete();
+        SetPrivateField(client, "_transport", transport);
+        SetPrivateField(client, "_isConnected", true);
+        SetPrivateField(client, "_isRegistered", true);
+
+        // Fire the inbound PING without awaiting: a *rate-limited* PONG would park on the
+        // limiter and hang the await. Observe the task so a park cancelled on dispose
+        // (the pre-fix path) does not surface as an unobserved exception.
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await InvokePrivateMethodAsync(
+                    client,
+                    "ProcessMessageAsync",
+                    IrcMessage.Parse("PING :liveness-token"));
+            }
+            catch
+            {
+                // Pre-fix: the parked rate-limit wait is cancelled when the client is disposed.
+            }
+        });
+
+        await WaitForConditionAsync(
+            () => transport.WrittenLines.Contains("PONG :liveness-token"),
+            TimeSpan.FromSeconds(2));
+
+        transport.WrittenLines.Should().Contain("PONG :liveness-token");
+    }
+
+    [Fact]
+    public async Task SendPing_WhenSendBucketExhausted_ShouldSendKeepalivePingWithoutRateLimitDelay()
+    {
+        // Companion to the PONG guard: the client's own keepalive PING is what keeps
+        // _lastPongReceived fresh. If the keepalive is throttled by the user-message rate
+        // limiter, a saturated "send" bucket starves it, _lastPongReceived goes stale, and
+        // the ping-timeout watchdog self-disconnects under sustained heavy outbound load.
+        using var client = new IrcClient(
+            new IrcClientOptions
+            {
+                Server = "irc.example.com",
+                Port = 6667,
+                Nick = "testbot",
+                UserName = "testuser",
+                RealName = "Test Bot",
+                UseSsl = false,
+                EnableRateLimit = true,
+                RateLimitConfig = new RateLimitConfig(refillRate: 0.001, bucketSize: 1, initialTokens: 0)
+            },
+            NullLogger<IrcClient>.Instance);
+
+        var transport = new BlockingTransport();
+        transport.AllowFirstWriteToComplete();
+        SetPrivateField(client, "_transport", transport);
+        SetPrivateField(client, "_isConnected", true);
+        SetPrivateField(client, "_isRegistered", true);
+
+        // Invoke the ping-timer callback directly; it fires the keepalive send internally.
+        InvokePrivateMethod(client, "SendPing", new object?[] { null });
+
+        await WaitForConditionAsync(
+            () => transport.WrittenLines.Any(line => line.StartsWith("PING :", StringComparison.Ordinal)),
+            TimeSpan.FromSeconds(2));
+
+        transport.WrittenLines.Should().Contain(line => line.StartsWith("PING :", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task SendMessageAsync_WhenConcurrentCallsTargetSameClient_ShouldSerializeTransportWrites()
     {
         var transport = new BlockingTransport();

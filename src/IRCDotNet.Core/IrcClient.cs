@@ -488,7 +488,27 @@ public class IrcClient : IIrcClient
     /// <param name="message">The raw IRC line to send (without trailing CRLF).</param>
     /// <exception cref="ArgumentException">Message is null, empty, or exceeds IRC length limits.</exception>
     /// <exception cref="InvalidOperationException">Not connected to a server.</exception>
-    public async Task SendRawAsync(string message)
+    public Task SendRawAsync(string message)
+    {
+        // Public/raw sends remain subject to the outbound rate limiter. Protocol-critical
+        // keepalive frames (PING/PONG) use the applyRateLimit:false core overload so they are
+        // never starved by a saturated user-message bucket.
+        return SendRawCoreAsync(message, applyRateLimit: true);
+    }
+
+    /// <summary>
+    /// Sends a raw IRC protocol message to the server, optionally bypassing the outbound rate limiter.
+    /// </summary>
+    /// <param name="message">The raw IRC line to send (without trailing CRLF).</param>
+    /// <param name="applyRateLimit">
+    /// When <c>true</c>, the message is subject to the configured outbound rate limiter. Protocol-critical
+    /// keepalive frames (the keepalive PING and the PONG response to a server PING) pass <c>false</c> so they
+    /// are never starved by a saturated user-message bucket, which would otherwise stall liveness and trigger
+    /// a false ping-timeout disconnect under heavy outbound load.
+    /// </param>
+    /// <exception cref="ArgumentException">Message is null, empty, or exceeds IRC length limits.</exception>
+    /// <exception cref="InvalidOperationException">Not connected to a server.</exception>
+    private async Task SendRawCoreAsync(string message, bool applyRateLimit)
     {
         if (string.IsNullOrWhiteSpace(message))
             throw new ArgumentException("Message cannot be null or empty", nameof(message));
@@ -528,8 +548,11 @@ public class IrcClient : IIrcClient
         }
 
         // Apply rate limiting to prevent flooding (if enabled)
-        // Skip rate limiting during registration — CAP/NICK/USER must not be delayed
-        if (_options.EnableRateLimit && _isRegistered)
+        // Skip rate limiting during registration — CAP/NICK/USER must not be delayed.
+        // Skip for protocol-critical keepalive frames (applyRateLimit:false) — PING and the PONG
+        // response must never be starved by a saturated user-message bucket, or liveness stalls and
+        // the connection is dropped on a false ping timeout under heavy outbound load.
+        if (applyRateLimit && _options.EnableRateLimit && _isRegistered)
         {
             try
             {
@@ -1255,7 +1278,9 @@ public class IrcClient : IIrcClient
     {
         if (message.Parameters.Count > 0)
         {
-            await SendRawAsync($"PONG :{message.Parameters[0]}").ConfigureAwait(false);
+            // PONG is a protocol-mandated liveness reply: bypass the rate limiter so a saturated
+            // user-message bucket can never delay it (a late PONG triggers a server/watchdog drop).
+            await SendRawCoreAsync($"PONG :{message.Parameters[0]}", applyRateLimit: false).ConfigureAwait(false);
         }
     }
 
@@ -2280,7 +2305,9 @@ public class IrcClient : IIrcClient
                 // Double-check connection state before sending
                 if (_isConnected)
                 {
-                    await SendRawAsync($"PING :{pingToken}").ConfigureAwait(false);
+                    // Keepalive PING bypasses the rate limiter: it is what keeps _lastPongReceived
+                    // fresh, so it must never be starved by a saturated user-message bucket.
+                    await SendRawCoreAsync($"PING :{pingToken}", applyRateLimit: false).ConfigureAwait(false);
                 }
             }, "PingTimerSend");
         }
