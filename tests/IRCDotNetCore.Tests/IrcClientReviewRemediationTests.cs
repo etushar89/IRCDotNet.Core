@@ -62,16 +62,20 @@ public sealed class IrcClientReviewRemediationTests : IDisposable
     [Fact]
     public async Task MonitorOffline_ForUnmonitoredNick_DoesNotRaiseSyntheticQuit()
     {
-        await RegisterAsync("me");
-        AddEnabledCapability(IrcCapabilities.MONITOR);
+        // Use a SHORT correlation window so that an erroneously scheduled finalizer would already
+        // have fired by the time we assert — otherwise (with the default 750ms window) the test would
+        // pass even if a stray quit were merely still pending behind the window.
+        using var client = CreateClient(correlationWindowMs: 60);
+        await RegisterAsync("me", client: client);
+        AddEnabledCapability(IrcCapabilities.MONITOR, client);
         // Deliberately NOT monitoring "Stranger".
 
         var quits = new List<UserQuitEvent>();
-        _client.UserQuit += (_, e) => quits.Add(e);
+        client.UserQuit += (_, e) => quits.Add(e);
 
-        await ProcessAsync($":server {IrcNumericReplies.RPL_MONOFFLINE} me :Stranger");
+        await ProcessAsync($":server {IrcNumericReplies.RPL_MONOFFLINE} me :Stranger", client);
 
-        // Give a finalize task (if one were erroneously scheduled) more than the correlation window.
+        // Wait well beyond the (short) correlation window: a wrongly scheduled finalizer fires at ~60ms.
         await Task.Delay(250);
         quits.Should().BeEmpty("an offline notice for a nick we never monitored must not manufacture a quit");
     }
@@ -241,6 +245,94 @@ public sealed class IrcClientReviewRemediationTests : IDisposable
         _client.Channels.Should().NotContainKey("#secret");
     }
 
+    // ---- P1: reconnect must abort once disposal is requested (not merely once it completes) ----
+
+    [Fact]
+    public async Task ReconnectScheduledBeforeDispose_AbortsPromptly_WithoutReopening()
+    {
+        var options = new IrcClientOptions
+        {
+            Server = "irc.example.com",
+            Port = 6667,
+            Nick = "me",
+            UserName = "me",
+            RealName = "me",
+            ReconnectDelayMs = 30000,
+            MaxReconnectDelayMs = 30000,
+            MaxReconnectAttempts = 5
+        };
+        var client = new IrcClient(options, NullLogger<IrcClient>.Instance);
+
+        // Kick off a reconnect attempt; it parks on the long backoff delay.
+        var attemptMethod = typeof(IrcClient).GetMethod("AttemptReconnectAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var attempt = (Task)attemptMethod.Invoke(client, null)!;
+
+        await Task.Delay(100);
+        attempt.IsCompleted.Should().BeFalse("the reconnect should still be parked on its backoff delay");
+
+        // DisposeAsync sets _disposeRequested immediately and must cancel the pending reconnect delay
+        // rather than letting it wake later and reopen the transport mid-disposal.
+        await client.DisposeAsync();
+
+        var finished = await Task.WhenAny(attempt, Task.Delay(TimeSpan.FromSeconds(5)));
+        finished.Should().BeSameAs(attempt, "disposal must cancel the pending reconnect backoff delay instead of waiting it out");
+        client.IsConnected.Should().BeFalse("a reconnect scheduled before disposal must not reopen the connection");
+    }
+
+    // ---- P2: MonitorNickAsync must register the nick BEFORE sending MONITOR + ------------------
+
+    [Fact]
+    public async Task MonitorNickAsync_AddsToMonitoredSet_BeforeWritingMonitorPlus()
+    {
+        using var client = CreateClient();
+        AddEnabledCapability(IrcCapabilities.MONITOR, client);
+
+        var monitoredAtWriteTime = false;
+        var transport = new RecordingTransport(line =>
+        {
+            if (line.StartsWith("MONITOR + Bob", StringComparison.Ordinal))
+            {
+                monitoredAtWriteTime = GetMonitoredNicks(client).Contains("Bob");
+            }
+        });
+        SetPrivateField(client, "_transport", transport);
+        SetPrivateField(client, "_isConnected", true);
+
+        await client.MonitorNickAsync("Bob");
+
+        monitoredAtWriteTime.Should().BeTrue(
+            "the nick must be in the monitored set before MONITOR + is written, so a fast RPL_MONOFFLINE/MONONLINE reply is not dropped by the unmonitored-offline guard");
+        GetMonitoredNicks(client).Should().Contain("Bob");
+    }
+
+    // ---- P2: fallback nick must stay RFC 2812 §2.3.1-valid even for a tiny advertised NICKLEN ---
+
+    [Fact]
+    public async Task NicknameInUse_FallbackNick_StartsWithValidChar_WhenNickLenIsTiny()
+    {
+        using var client = CreateClient(nick: "Bot");
+        var transport = new RecordingTransport();
+        SetPrivateField(client, "_transport", transport);
+        SetPrivateField(client, "_isConnected", true);
+        SetPrivateField(client, "_currentNick", "Bot");
+
+        // A pathologically small NICKLEN: the 4-digit suffix alone would fill it and start with a digit.
+        await ProcessAsync($":server {IrcNumericReplies.RPL_ISUPPORT} Bot NICKLEN=4 :are supported by this server", client);
+        await ProcessAsync(":server 433 * Bot :Nickname is already in use.", client);
+
+        await WaitUntilAsync(
+            () => transport.WrittenLines.Any(l => l.StartsWith("NICK ", StringComparison.Ordinal)),
+            TimeSpan.FromSeconds(3));
+
+        var nick = client.CurrentNick;
+        nick.Length.Should().BeInRange(1, 4, "the fallback must fit within the advertised NICKLEN");
+        IsValidNickStart(nick).Should().BeTrue(
+            "RFC 2812 §2.3.1 requires a nickname to start with a letter or special character, never a digit");
+    }
+
+    private static bool IsValidNickStart(string nick) =>
+        !string.IsNullOrEmpty(nick) && (char.IsLetter(nick[0]) || "[]\\`_^{|}".IndexOf(nick[0]) >= 0);
+
     // ---- Helpers ------------------------------------------------------------------------------
 
     private static IrcClient CreateClient(string nick = "me", int? correlationWindowMs = null)
@@ -364,6 +456,12 @@ public sealed class IrcClientReviewRemediationTests : IDisposable
     private sealed class RecordingTransport : IIrcTransport
     {
         private readonly List<string> _writtenLines = new();
+        private readonly Action<string>? _onWrite;
+
+        public RecordingTransport(Action<string>? onWrite = null)
+        {
+            _onWrite = onWrite;
+        }
 
         public bool IsConnected => true;
 
@@ -384,6 +482,7 @@ public sealed class IrcClientReviewRemediationTests : IDisposable
 
         public Task WriteLineAsync(string line, CancellationToken cancellationToken = default)
         {
+            _onWrite?.Invoke(line);
             lock (_writtenLines)
             {
                 _writtenLines.Add(line);

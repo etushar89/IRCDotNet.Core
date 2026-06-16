@@ -124,10 +124,75 @@ public sealed class IrcClientCaseMappingTests : IDisposable
         // rfc1459: Bob[] == bob{} ; the rename of the monitored identity must be tracked.
         await ProcessAsync(":bob{}!u@h NICK :Bobby");
 
+        // Wait on the asynchronously-dispatched NickChanged event — the LAST signal in the rename path.
+        // (The monitored-set mutation runs synchronously under the state lock and would otherwise let the
+        // assertions race ahead of the event dispatch under parallel-suite load.)
+        await WaitUntilAsync(() => nickChanges.Count > 0, TimeSpan.FromSeconds(3));
         await WaitUntilAsync(() => GetMonitoredNicks().Contains("Bobby"), TimeSpan.FromSeconds(3));
         nickChanges.Should().NotBeEmpty();
         GetMonitoredNicks().Should().Contain("Bobby");
         GetMonitoredNicks().Should().NotContain(n => string.Equals(n, "Bob[]", StringComparison.Ordinal));
+    }
+
+    // ---- P1: a dynamic-mapping comparer must keep a STABLE hash code -------------------------------
+    // A comparer whose hash code shifts with the live CASEMAPPING corrupts any hash table it backs:
+    // a key inserted under one mapping lands in one bucket, and after the mapping changes the same
+    // key hashes to a different bucket and becomes unreachable (the reviewer reproduced an entry that
+    // was unreachable by BOTH "Nick[]" and "nick{}" after rfc1459 -> ascii). The hash must therefore
+    // be anchored to the most-folding (rfc1459) mapping while equality follows the live mapping.
+
+    [Fact]
+    public void DynamicCaseComparer_KeepsEntryReachable_WhenMappingChangesAfterInsertion()
+    {
+        var mapping = CaseMappingType.Rfc1459;
+        var comparer = IrcCaseMapping.CreateComparer(() => mapping);
+        var table = new Dictionary<string, int>(comparer) { ["Nick[]"] = 1 };
+
+        // Server refines the mapping to ascii AFTER the key was inserted.
+        mapping = CaseMappingType.Ascii;
+
+        table.ContainsKey("Nick[]").Should().BeTrue("the inserted key must remain reachable after a mapping change");
+        table["Nick[]"].Should().Be(1);
+        table.Remove("Nick[]").Should().BeTrue("the inserted key must remain removable after a mapping change");
+    }
+
+    [Fact]
+    public void DynamicCaseComparer_AppliesLiveMapping_ToEquality()
+    {
+        // Under ascii, "Nick[]" and "nick{}" are distinct identities and must coexist.
+        var ascii = CaseMappingType.Ascii;
+        var asciiTable = new Dictionary<string, int>(IrcCaseMapping.CreateComparer(() => ascii))
+        {
+            ["Nick[]"] = 1,
+            ["nick{}"] = 2
+        };
+        asciiTable.Should().HaveCount(2);
+        asciiTable["Nick[]"].Should().Be(1);
+        asciiTable["nick{}"].Should().Be(2);
+
+        // Under rfc1459, the same two strings fold to one identity and must collapse.
+        var rfc = CaseMappingType.Rfc1459;
+        var rfcTable = new Dictionary<string, int>(IrcCaseMapping.CreateComparer(() => rfc))
+        {
+            ["Nick[]"] = 1
+        };
+        rfcTable["nick{}"] = 2; // same key under rfc1459 -> overwrites
+        rfcTable.Should().ContainSingle();
+        rfcTable["Nick[]"].Should().Be(2);
+    }
+
+    [Fact]
+    public async Task MonitoredNick_StaysReachable_WhenCaseMappingChangesAfterInsertion()
+    {
+        // Default mapping before ISUPPORT is rfc1459. Monitor a bracketed nick, then have the server
+        // advertise CASEMAPPING=ascii: the monitored-nick set must not lose the entry to a shifted hash.
+        await ProcessAsync($":irc.example.com {IrcNumericReplies.RPL_WELCOME} observer :Welcome");
+        AddMonitoredNick("Nick[]");
+
+        await ProcessAsync($":irc.example.com {IrcNumericReplies.RPL_ISUPPORT} observer CASEMAPPING=ascii :are supported by this server");
+
+        GetMonitoredNicks().Should().Contain("Nick[]",
+            "a monitored nick inserted before the mapping changed must remain reachable afterwards");
     }
 
     private async Task RegisterAsync(string nick, string caseMapping)

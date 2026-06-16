@@ -76,6 +76,11 @@ public class IrcClient : IIrcClient
     private readonly CancellationTokenSource _monitorOfflineCts = new();
     private long _monitorOfflineSequence;
 
+    // Cancelled the instant disposal is *requested* (before the slow disconnect/event-drain work runs)
+    // so a reconnect already parked on its backoff delay aborts immediately instead of waking later and
+    // reopening the transport mid-disposal. Reconnect/connect entry also gate on _disposeRequested.
+    private readonly CancellationTokenSource _disposalCts = new();
+
     // Protocol enhancements
     private readonly IrcRateLimiter _rateLimiter;
     private readonly IsupportParser _isupportParser;
@@ -292,8 +297,10 @@ public class IrcClient : IIrcClient
 
         // Nick- and channel-keyed collections must compare keys using the server's negotiated
         // CASEMAPPING (RFC 2812 §1.3), not ordinal/OrdinalIgnoreCase. The mapping is learned from
-        // ISUPPORT (005) during registration — before any of these collections are populated — so a
-        // comparer that resolves the mapping dynamically stays correct without rebuilds.
+        // ISUPPORT (005) and may arrive after some state already exists, so the comparer resolves the
+        // mapping dynamically for equality while anchoring its hash to the coarsest (RFC 1459) folding.
+        // That keeps every key's hash stable across a mapping change, so entries inserted before 005 can
+        // never become stranded in the wrong bucket (see IrcCaseMapping.DynamicIrcCaseComparer).
         _caseMappingComparer = IrcCaseMapping.CreateComparer(() => _isupportParser.CaseMapping);
         _channels = new ConcurrentDictionary<string, ConcurrentHashSet<string>>(_caseMappingComparer);
         _pendingNamesUsers = new ConcurrentDictionary<string, PendingNamesState>(_caseMappingComparer);
@@ -346,6 +353,10 @@ public class IrcClient : IIrcClient
     /// <exception cref="InvalidOperationException">Already connected or connection already in progress.</exception>
     public async Task ConnectAsync(CancellationToken cancellationToken = default)
     {
+        // A reconnect worker that woke just as disposal began must not reopen the connection.
+        if (_disposeRequested != 0 || _disposed != 0)
+            throw new ObjectDisposedException(nameof(IrcClient));
+
         if (!await _connectLock.WaitAsync(0, cancellationToken).ConfigureAwait(false))
             throw new InvalidOperationException("A connection attempt is already in progress");
 
@@ -2284,10 +2295,21 @@ public class IrcClient : IIrcClient
 
         var maxLen = Math.Max(1, _isupportParser.MaxNicknameLength);
 
-        // No room for any base characters — return as much of the suffix as fits.
+        // Not enough room for the base plus the full suffix. The result must still satisfy the RFC 2812
+        // §2.3.1 grammar (a nick starts with a letter or special char, never a digit), so anchor the
+        // first character to the valid base nick and fill the remaining room with the suffix's tail —
+        // the most-significant changing digits — so successive retries still vary and don't loop on an
+        // identical, server-rejected nick. baseNick is already forced to a valid-start value above.
         if (suffix.Length >= maxLen)
         {
-            return suffix.Length <= maxLen ? suffix : suffix[..maxLen];
+            if (maxLen == 1)
+            {
+                return baseNick[..1];
+            }
+
+            var suffixRoom = maxLen - 1;
+            var fittedSuffix = suffix.Length <= suffixRoom ? suffix : suffix[^suffixRoom..];
+            return baseNick[..1] + fittedSuffix;
         }
 
         var room = maxLen - suffix.Length;
@@ -2465,8 +2487,11 @@ public class IrcClient : IIrcClient
 
     private async Task AttemptReconnectAsync()
     {
-        // _disposed is volatile, so a direct read already carries acquire semantics.
-        if (_disposed != 0)
+        // Gate on _disposeRequested (set at the very start of Dispose/DisposeAsync) rather than only
+        // _disposed (set late, after disconnect + event-drain). Otherwise a reconnect scheduled just
+        // before disposal could slip through and reopen the transport while disposal is underway.
+        // _disposed/_disposeRequested are volatile, so a direct read already carries acquire semantics.
+        if (_disposeRequested != 0 || _disposed != 0)
         {
             return;
         }
@@ -2483,9 +2508,20 @@ public class IrcClient : IIrcClient
         var delay = Math.Min(_options.ReconnectDelayMs * attempt, _options.MaxReconnectDelayMs);
 
         _logger?.LogInformation("Attempting to reconnect in {Delay}ms (attempt {Attempt})", delay, attempt);
-        await Task.Delay(delay).ConfigureAwait(false);
 
-        if (_disposed != 0)
+        // A cancellable backoff: if disposal is requested while we wait it out, _disposalCts fires and we
+        // abort promptly instead of waking later to reopen the connection. ObjectDisposedException covers
+        // the micro-race where the source is disposed between the entry gate and this await.
+        try
+        {
+            await Task.Delay(delay, _disposalCts.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException)
+        {
+            return;
+        }
+
+        if (_disposeRequested != 0 || _disposed != 0)
         {
             return;
         }
@@ -2519,13 +2555,20 @@ public class IrcClient : IIrcClient
         catch (Exception ex)
         {
             _logger?.LogError(ex, "Reconnection failed");
-            // Schedule the next attempt unless we've been disposed or hit the attempt ceiling.
-            if (_disposed == 0 &&
+            // Schedule the next attempt unless disposal has been requested or we've hit the ceiling.
+            if (_disposeRequested == 0 && _disposed == 0 &&
                 (_options.MaxReconnectAttempts <= 0 || attempt < _options.MaxReconnectAttempts))
             {
                 SafeFireAndForget(async () =>
                 {
-                    await Task.Delay(1000).ConfigureAwait(false);
+                    try
+                    {
+                        await Task.Delay(1000, _disposalCts.Token).ConfigureAwait(false);
+                    }
+                    catch (Exception delayEx) when (delayEx is OperationCanceledException or ObjectDisposedException)
+                    {
+                        return;
+                    }
                     await AttemptReconnectAsync().ConfigureAwait(false);
                 }, "ReconnectRetry");
             }
@@ -2655,8 +2698,23 @@ public class IrcClient : IIrcClient
             throw new InvalidOperationException("monitor capability not enabled");
         }
 
-        await SendRawAsync($"MONITOR + {nick}").ConfigureAwait(false);
-        _monitoredNicks.Add(nick);
+        // Register the nick BEFORE writing MONITOR +. The server can reply with RPL_MONOFFLINE/MONONLINE
+        // for this target before the await returns; the read loop would then run HandleMonitorOffline,
+        // whose unmonitored-offline guard drops any nick not already in the set. Adding first closes that
+        // window. Roll back if the write fails so a failed request doesn't leave a phantom monitored nick.
+        var added = _monitoredNicks.Add(nick);
+        try
+        {
+            await SendRawAsync($"MONITOR + {nick}").ConfigureAwait(false);
+        }
+        catch
+        {
+            if (added)
+            {
+                _monitoredNicks.Remove(nick);
+            }
+            throw;
+        }
     }
 
     /// <summary>
@@ -2702,6 +2760,16 @@ public class IrcClient : IIrcClient
             // Don't block - just signal cancellation and cleanup synchronously
             _cancellationTokenSource?.Cancel();
 
+            // Abort any reconnect parked on its backoff delay before it can wake and reopen the transport.
+            try
+            {
+                _disposalCts.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Already disposed via a prior DisposeAsync; nothing to do.
+            }
+
             // Cancel and release the monitor-offline correlation source so its pending finalizers abort
             // promptly instead of waiting out the correlation window.
             try
@@ -2734,6 +2802,7 @@ public class IrcClient : IIrcClient
             _isConnected = false;
 
             _monitorOfflineCts.Dispose();
+            _disposalCts.Dispose();
             _cancellationTokenSource?.Dispose();
             _sendLock?.Dispose();
             _connectLock?.Dispose();
@@ -2752,6 +2821,17 @@ public class IrcClient : IIrcClient
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposeRequested, 1) == 1) return;
+
+        // Abort any reconnect parked on its backoff delay up front — before the (potentially slow)
+        // disconnect and event-drain below — so it cannot wake and reopen the transport mid-disposal.
+        try
+        {
+            _disposalCts.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Already disposed via a prior synchronous Dispose; nothing to do.
+        }
 
         try
         {
@@ -2782,6 +2862,7 @@ public class IrcClient : IIrcClient
             }
 
             _monitorOfflineCts.Dispose();
+            _disposalCts.Dispose();
             _cancellationTokenSource?.Dispose();
             _sendLock?.Dispose();
             _connectLock?.Dispose();

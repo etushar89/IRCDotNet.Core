@@ -251,8 +251,24 @@ public static class IrcCaseMapping
     }
 
     /// <summary>
-    /// String comparer that resolves the IRC case mapping dynamically on each comparison.
+    /// String comparer that resolves the IRC case mapping dynamically on each comparison for
+    /// <em>equality</em>, while keeping a <em>stable</em> hash code so the comparer can safely back a
+    /// hash table whose mapping is learned (or refined) after keys have been inserted.
     /// </summary>
+    /// <remarks>
+    /// A hash table requires that equal items share a hash code and that an item's hash never changes
+    /// while it is stored. The server's CASEMAPPING is learned from ISUPPORT (005) and can arrive after
+    /// state already exists (e.g. <c>Connected</c> is raised on 001). If the hash followed the live
+    /// mapping it would shift when the mapping changed, stranding existing keys in the wrong bucket.
+    /// <para>
+    /// To stay correct the hash is anchored to RFC 1459 folding — the <em>coarsest</em> mapping, which
+    /// folds <c>A–Z</c> plus <c>[]\^</c> → <c>{}|~</c>. Any two strings that are equal under <em>any</em>
+    /// supported mapping are also equal under RFC 1459, so they always hash to the same bucket; the
+    /// live mapping is then applied in <see cref="Equals(string?, string?)"/> to disambiguate within the
+    /// bucket. The only effect of a narrower live mapping (e.g. ASCII) is a few extra, harmless hash
+    /// collisions, never an unreachable entry.
+    /// </para>
+    /// </remarks>
     private sealed class DynamicIrcCaseComparer : IEqualityComparer<string>
     {
         private readonly Func<CaseMappingType> _mappingProvider;
@@ -269,7 +285,9 @@ public static class IrcCaseMapping
 
         public int GetHashCode(string obj)
         {
-            return IrcCaseMapping.GetHashCode(obj, _mappingProvider());
+            // Anchor the hash to the coarsest (RFC 1459) folding so it is independent of the live
+            // mapping and therefore stable for the lifetime of a stored key. See the type remarks.
+            return IrcCaseMapping.GetHashCode(obj, CaseMappingType.Rfc1459);
         }
     }
 }
