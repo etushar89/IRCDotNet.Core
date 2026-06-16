@@ -333,6 +333,105 @@ public sealed class IrcClientReviewRemediationTests : IDisposable
     private static bool IsValidNickStart(string nick) =>
         !string.IsNullOrEmpty(nick) && (char.IsLetter(nick[0]) || "[]\\`_^{|}".IndexOf(nick[0]) >= 0);
 
+    // ---- P1: disposal must serialize with an in-flight connect (post-delay reconnect interleaving) ----
+
+    [Fact]
+    public async Task DisposeAsync_SerializesBehindInFlightConnect()
+    {
+        var client = CreateClient();
+        var connectLock = GetPrivateField<SemaphoreSlim>(client, "_connectLock")!;
+
+        // Simulate a reconnect worker that has passed every disposal check and is now inside ConnectAsync
+        // holding the connect lock while it builds the transport.
+        await connectLock.WaitAsync();
+
+        var disposeTask = client.DisposeAsync().AsTask();
+
+        await Task.Delay(150);
+        disposeTask.IsCompleted.Should().BeFalse(
+            "disposal must serialize behind an in-flight connect (via the connect lock) instead of clearing state underneath it and letting the connect reopen a live transport");
+
+        // Releasing the lock — as a finishing or aborting ConnectAsync would — lets disposal proceed.
+        connectLock.Release();
+        var finished = await Task.WhenAny(disposeTask, Task.Delay(TimeSpan.FromSeconds(10)));
+        finished.Should().BeSameAs(disposeTask, "disposal must complete once the in-flight connect releases the connect lock");
+    }
+
+    // ---- P2: UnmonitorNickAsync must remove locally BEFORE sending MONITOR - --------------------
+
+    [Fact]
+    public async Task UnmonitorNickAsync_RemovesFromMonitoredSet_BeforeWritingMonitorMinus()
+    {
+        using var client = CreateClient();
+        AddEnabledCapability(IrcCapabilities.MONITOR, client);
+        AddMonitoredNick("Bob", client);
+
+        var monitoredAtWriteTime = true;
+        var transport = new RecordingTransport(line =>
+        {
+            if (line.StartsWith("MONITOR - Bob", StringComparison.Ordinal))
+            {
+                monitoredAtWriteTime = GetMonitoredNicks(client).Contains("Bob");
+            }
+        });
+        SetPrivateField(client, "_transport", transport);
+        SetPrivateField(client, "_isConnected", true);
+
+        await client.UnmonitorNickAsync("Bob");
+
+        monitoredAtWriteTime.Should().BeFalse(
+            "the nick must leave the monitored set before MONITOR - is written, so a final RPL_MONOFFLINE reply is dropped by the unmonitored-offline guard");
+        GetMonitoredNicks(client).Should().NotContain("Bob");
+    }
+
+    // ---- P2: unmonitoring within the correlation window cancels a pending synthetic quit -------
+
+    [Fact]
+    public async Task UnmonitorNick_DuringCorrelationWindow_SuppressesSyntheticQuit()
+    {
+        using var client = CreateClient(correlationWindowMs: 200);
+        await RegisterAsync("me", client: client);
+        AddEnabledCapability(IrcCapabilities.MONITOR, client);
+        AddMonitoredNick("Bob", client);
+        var transport = new RecordingTransport();
+        SetPrivateField(client, "_transport", transport);
+        SetPrivateField(client, "_isConnected", true);
+
+        var quits = new List<UserQuitEvent>();
+        client.UserQuit += (_, e) => quits.Add(e);
+
+        // The offline schedules a synthetic-quit finalizer behind the correlation window.
+        await ProcessAsync($":server {IrcNumericReplies.RPL_MONOFFLINE} me :Bob", client);
+        // The consumer stops monitoring Bob before the window elapses.
+        await client.UnmonitorNickAsync("Bob");
+
+        await Task.Delay(400); // > correlation window
+        quits.Should().BeEmpty("unmonitoring a nick within the correlation window must cancel its pending synthetic quit");
+    }
+
+    // ---- P2: the offline finalizer must re-check monitoring before raising UserQuit -----------
+
+    [Fact]
+    public async Task MonitorOffline_ThenUnmonitoredViaSetRemoval_DoesNotRaiseSyntheticQuit()
+    {
+        using var client = CreateClient(correlationWindowMs: 150);
+        await RegisterAsync("me", client: client);
+        AddEnabledCapability(IrcCapabilities.MONITOR, client);
+        AddMonitoredNick("Bob", client);
+
+        var quits = new List<UserQuitEvent>();
+        client.UserQuit += (_, e) => quits.Add(e);
+
+        // The offline schedules the finalizer while Bob is still monitored (pending entry created).
+        await ProcessAsync($":server {IrcNumericReplies.RPL_MONOFFLINE} me :Bob", client);
+        // Model the race where monitoring is dropped AFTER the pending entry exists but the pending entry
+        // itself is not cleared: the finalizer must re-check monitoring and suppress the quit.
+        RemoveMonitoredNick("Bob", client);
+
+        await Task.Delay(350); // > correlation window
+        quits.Should().BeEmpty("the offline finalizer must re-check monitoring and suppress the quit for a nick that is no longer monitored");
+    }
+
     // ---- Helpers ------------------------------------------------------------------------------
 
     private static IrcClient CreateClient(string nick = "me", int? correlationWindowMs = null)
@@ -404,6 +503,14 @@ public sealed class IrcClientReviewRemediationTests : IDisposable
             .GetField("_monitoredNicks", BindingFlags.NonPublic | BindingFlags.Instance)!
             .GetValue(client ?? _client)!;
         set.Add(nick);
+    }
+
+    private void RemoveMonitoredNick(string nick, IrcClient? client = null)
+    {
+        var set = (ConcurrentHashSet<string>)typeof(IrcClient)
+            .GetField("_monitoredNicks", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(client ?? _client)!;
+        set.Remove(nick);
     }
 
     private static void SetPrivateField(IrcClient client, string fieldName, object? value)

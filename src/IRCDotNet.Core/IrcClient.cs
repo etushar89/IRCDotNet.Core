@@ -362,6 +362,12 @@ public class IrcClient : IIrcClient
 
         try
         {
+            // Disposal does not take _connectLock, so re-check after acquiring it: disposal may have begun
+            // (and started cancelling/clearing state via DisposeAsync) between the entry check above and
+            // here. Without this, a reconnect that just won the lock would rebuild state under disposal.
+            if (_disposeRequested != 0 || _disposed != 0)
+                throw new ObjectDisposedException(nameof(IrcClient));
+
             if (_isConnected)
                 throw new InvalidOperationException("Already connected");
 
@@ -370,7 +376,20 @@ public class IrcClient : IIrcClient
                 _logger?.LogInformation("Connecting to {Endpoint}",
                     !string.IsNullOrWhiteSpace(_options.WebSocketUri)
                         ? _options.WebSocketUri
-                        : $"{_options.Server}:{_options.Port} (SSL: {_options.UseSsl})"); _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                        : $"{_options.Server}:{_options.Port} (SSL: {_options.UseSsl})");
+
+                // Link the connection lifetime to BOTH the caller token and the disposal token. If disposal
+                // is requested mid-connect, _disposalCts fires and cancels the in-flight transport connect /
+                // read loop instead of letting them complete and leak a live socket past disposal.
+                try
+                {
+                    _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposalCts.Token);
+                }
+                catch (ObjectDisposedException)
+                {
+                    // _disposalCts was disposed by a concurrent (synchronous) Dispose; treat as disposed.
+                    throw new ObjectDisposedException(nameof(IrcClient));
+                }
 
                 // Create transport (WebSocket or TCP)
                 if (!string.IsNullOrWhiteSpace(_options.WebSocketUri))
@@ -382,7 +401,14 @@ public class IrcClient : IIrcClient
                     _transport = new TcpIrcTransport(_options, _logger);
                 }
 
-                await _transport.ConnectAsync(cancellationToken).ConfigureAwait(false);
+                await _transport.ConnectAsync(_cancellationTokenSource.Token).ConfigureAwait(false);
+
+                // Re-check before publishing connected state and spinning up the read loop / ping timer:
+                // disposal may have been requested during the transport connect. Bailing here (the catch
+                // below tears the transport down) prevents a read loop and ping timer that would outlive
+                // disposal.
+                if (_disposeRequested != 0 || _disposed != 0)
+                    throw new ObjectDisposedException(nameof(IrcClient));
 
                 _isConnected = true;
                 _logger?.LogInformation("Connected to IRC server");            // Start read loop
@@ -2729,8 +2755,27 @@ public class IrcClient : IIrcClient
             throw new InvalidOperationException("monitor capability not enabled");
         }
 
-        await SendRawAsync($"MONITOR - {nick}").ConfigureAwait(false);
-        _monitoredNicks.Remove(nick);
+        // Mirror MonitorNickAsync: drop the nick locally BEFORE writing MONITOR -. The server may send a
+        // final RPL_MONOFFLINE in response; removing first ensures HandleMonitorOffline's unmonitored-
+        // offline guard drops it instead of manufacturing a synthetic quit for a nick the consumer just
+        // stopped monitoring. Also discard any already-pending offline finalizer for this nick so a quit
+        // scheduled before the unmonitor cannot still fire after it.
+        var removed = _monitoredNicks.Remove(nick);
+        _pendingMonitoredOfflines.TryRemove(nick, out _);
+        try
+        {
+            await SendRawAsync($"MONITOR - {nick}").ConfigureAwait(false);
+        }
+        catch
+        {
+            // The send failed, so the server still considers the nick monitored; restore local state to
+            // match rather than silently dropping a still-tracked nick.
+            if (removed)
+            {
+                _monitoredNicks.Add(nick);
+            }
+            throw;
+        }
     }
 
     /// <summary>
@@ -2833,6 +2878,20 @@ public class IrcClient : IIrcClient
             // Already disposed via a prior synchronous Dispose; nothing to do.
         }
 
+        // Serialize behind any in-flight ConnectAsync so disposal cannot interleave with connect setup and
+        // clear state underneath it (which would leave a live transport / read loop / ping timer running
+        // past disposal). The _disposalCts cancel above aborts an in-flight transport connect promptly, so
+        // this wait is normally short; the bound is a safety cap for a transport that ignores cancellation.
+        var connectLockHeld = false;
+        try
+        {
+            connectLockHeld = await _connectLock.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        }
+        catch (ObjectDisposedException)
+        {
+            // _connectLock already disposed by a prior synchronous Dispose; proceed best-effort.
+        }
+
         try
         {
             await DisconnectInternalAsync("Client disposed").ConfigureAwait(false);
@@ -2843,6 +2902,12 @@ public class IrcClient : IIrcClient
         }
         finally
         {
+            // Release the connect lock now that connect/disposal are serialized, before disposing it below.
+            if (connectLockHeld)
+            {
+                _connectLock.Release();
+            }
+
             // Stop accepting new event dispatches, then drain those already queued (e.g. the final
             // Disconnected notification raised by DisconnectInternalAsync) so subscribers are not
             // silently dropped when the client is disposed.
@@ -3349,6 +3414,16 @@ public class IrcClient : IIrcClient
         }
 
         _userInfo.TryRemove(pending.Nick, out _);
+
+        // Defense-in-depth re-check: monitoring may have been dropped (UnmonitorNickAsync, or a monitor-set
+        // mutation) after this offline was scheduled but without the pending entry being cleared first.
+        // Suppress the synthetic quit for a nick the consumer is no longer monitoring — the cached user
+        // info is still cleared above because the server told us the nick went offline.
+        if (!_monitoredNicks.Contains(pending.Nick))
+        {
+            return;
+        }
+
         RaiseEventAsync(UserQuit, new UserQuitEvent(pending.Message, pending.Nick, pending.User, pending.Host, reason: null, isSynthetic: true));
     }
 
