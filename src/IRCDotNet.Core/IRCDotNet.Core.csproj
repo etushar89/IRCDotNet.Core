@@ -10,7 +10,7 @@
     <PackageId>IRCDotNet.Core</PackageId>
     <Version>2.5.2</Version>
     <Authors>Tushar Sudake</Authors>
-    <Description>Modern .NET 8 IRC client library with full IRCv3 support — SASL, message tags, capabilities negotiation, CTCP (VERSION/PING/ACTION), WebSocket and TCP/SSL transports, rate limiting, auto-reconnect, typing indicator, MOTD, and 41 typed events. Based on RFC 1459 and the Modern IRC Client Protocol.</Description>
+    <Description>Modern .NET 8 IRC client library with full IRCv3 support — SASL, message tags, capabilities negotiation, CTCP (VERSION/PING/ACTION), WebSocket and TCP/SSL transports, rate limiting, auto-reconnect, typing indicator, MOTD, and 42 typed events. Based on RFC 1459 and the Modern IRC Client Protocol.</Description>
     <PackageTags>irc;irc-client;ircv3;internet-relay-chat;chat;networking;sasl;protocol;real-time;async;event-driven;rate-limiting;auto-reconnect;websocket;ctcp;typing;tagmsg;dotnet;csharp</PackageTags>
     <RepositoryUrl>https://github.com/etushar89/IRCDotNet.Core</RepositoryUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
@@ -25,12 +25,19 @@ v2.5.2 (reliability &amp; correctness hardening):
 - Fixed: MONITOR offline finalization is now race-free; an offline immediately followed by online no longer emits a spurious quit
 - Fixed: a stray RPL_MONOFFLINE for a nick that is not (or no longer) monitored no longer manufactures a synthetic quit
 - New: ERR_MONLISTFULL (734) handling — rejected MONITOR targets are removed from the local set and surfaced via ErrorReplyReceived; RPL_MONLIST/RPL_ENDOFMONLIST (732/733) are routed
+- New: monitor and extended-monitor are now requested by default during capability negotiation
 - Fixed: registration NICK retries after ERR_NICKNAMEINUSE (433) are now bounded (max 5) and the fallback nick respects an advertised NICKLEN, instead of retrying forever
 - Fixed: negotiated ISUPPORT tokens (CASEMAPPING, CHANTYPES, …) reset on disconnect so a stale value cannot leak into the next connection
 - Fixed: MODE target classification now uses the server-advertised CHANTYPES instead of a hardcoded prefix set
 - Fixed: a failed JOIN no longer leaves an orphaned pending-NAMES buffer; a self-part before ENDOFNAMES no longer resurrects the channel
+- Fixed: monitored PM-only contacts no longer infer nickname changes from monitor activity plus matching user@host identity; tracking moves to a renamed nick only on an explicit server NICK event
+- New: IsupportReceived is now part of the IIrcClient interface (previously only on the concrete IrcClient)
+- Hardened: nickname and channel identity stay correct even when the server changes CASEMAPPING mid-session — entries hash stably so a key inserted under one mapping remains reachable after a switch
+- Hardened: a scheduled reconnect can no longer reopen the connection during disposal (even after its backoff delay elapses), and disposal now serializes with an in-flight connect attempt instead of racing it
+- Hardened: MONITOR add/remove update the local monitored set before sending the command (rolling back on failure), so a fast RPL_MONOFFLINE/MONONLINE cannot be mishandled; unmonitoring a nick also cancels any pending synthetic quit for it
+- Hardened: the fallback nick generated after ERR_NICKNAMEINUSE (433) always begins with a valid leading character (RFC 2812 §2.3.1) even under a very small NICKLEN
 - Hardened: disposal now drains queued events (including the final Disconnected) in order; reconnect attempt counting and channel-rejoin list handling are race-free
-- IIrcClient interface: 6 properties, 37 methods, 35 events
+- IIrcClient interface: 6 properties, 44 methods, 36 events (the previously published 37-method/35-event figure was a documentation undercount plus the newly exposed IsupportReceived; no methods were added or removed this release)
 
 Full changelog: https://github.com/etushar89/IRCDotNet.Core#changelog
     </PackageReleaseNotes>

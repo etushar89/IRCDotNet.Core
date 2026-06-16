@@ -20,7 +20,7 @@ dotnet add package IRCDotNet.Core
 - **Rate Limiting** — Configurable token-bucket algorithm prevents flood protection kicks
 - **Auto-Reconnect** — Exponential backoff with automatic channel rejoin
 - **Thread-Safe** — `ConcurrentDictionary`, `ConcurrentHashSet`, semaphore-controlled sends, volatile state
-- **Event-Driven** — 41 event types with threaded, sequential, or background dispatch strategies
+- **Event-Driven** — 42 event types with threaded, sequential, or background dispatch strategies
 - **Fluent Builder** — `IrcClientOptionsBuilder` for type-safe configuration
 - **Dependency Injection** — `IServiceCollection` integration with `AddIrcClient()` and `AddIrcBotManager()`
 - **Multi-Client Management** — `IrcBotManager` as an `IHostedService` for managing multiple connections
@@ -823,7 +823,8 @@ public class MyService(IrcClient client) { }  // also works, but not mockable
 - `CtcpReplyEvent.IsEcho` — echoed CTCP replies (delivered via the `echo-message` capability) are now surfaced and flagged instead of being silently dropped
 - `IrcClientOptions.MonitorOfflineCorrelationWindowMs` (default `750`) — configurable window that suppresses a synthetic quit when a monitored nick flaps offline→online
 - `ERR_MONLISTFULL` (734) handling — rejected MONITOR targets are removed from the local set and surfaced via `ErrorReplyReceived`; `RPL_MONLIST`/`RPL_ENDOFMONLIST` (732/733) are routed
-- `extended-monitor` added to the default recommended IRCv3 capability set alongside `monitor`
+- `monitor` and `extended-monitor` are now requested by default during capability negotiation (added to `IrcClientOptions.RequestedCapabilities`)
+- `IsupportReceived` is now declared on the `IIrcClient` interface (previously only on the concrete `IrcClient`)
 
 **Fixes:**
 - Nickname and channel identity comparisons now honour the server's `CASEMAPPING` (RFC 2812 §1.3) instead of ordinal comparison — on an `rfc1459` network `Nick[]` and `nick{}` are correctly treated as the same identity across channel rosters, user tracking, echo detection, and MONITOR
@@ -838,9 +839,17 @@ public class MyService(IrcClient client) { }  // also works, but not mockable
 **Hardening:**
 - Disposal now drains queued events (including the final `Disconnected`) in order rather than dropping them
 - Reconnect attempt counting and channel-rejoin list handling are now race-free
+- Nickname and channel identity stay correct even when the server changes `CASEMAPPING` mid-session — entries hash stably, so a key inserted under one mapping remains reachable after a switch
+- A scheduled reconnect can no longer reopen the connection during disposal even after its backoff delay elapses, and disposal now serializes with an in-flight connect attempt rather than racing it
+- `MonitorNickAsync`/`UnmonitorNickAsync` update the local monitored set before sending the command (rolling back on send failure), so a fast `RPL_MONOFFLINE`/`MONONLINE` reply cannot be mishandled; unmonitoring a nick also cancels any pending synthetic quit for it
+- The fallback nick generated after `ERR_NICKNAMEINUSE` (433) always begins with a valid leading character (RFC 2812 §2.3.1) even under a very small `NICKLEN`
+
+**Interface:**
+- `IIrcClient`: 6 properties, 44 methods, 36 events. (The previously published 37-method/35-event figure was a documentation undercount plus the newly exposed `IsupportReceived`; no methods were added or removed this release.)
 
 **Tests:**
 - Added case-mapping, MONITOR list/correlation, bounded-433, NICKLEN-fallback, echoed-CTCP, ISUPPORT-reset, phantom-channel, and join-failure regression coverage
+- Added runtime `CASEMAPPING`-change reachability, reconnect-during-disposal, dispose/connect serialization, and MONITOR add/remove ordering regression coverage
 - Updated unit coverage to enforce explicit-only monitor nickname handling
 - Updated live concurrency coverage to require explicit rename signals before transferring monitor state
 
