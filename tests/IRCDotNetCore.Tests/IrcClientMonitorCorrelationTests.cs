@@ -41,6 +41,9 @@ public sealed class IrcClientMonitorLifecycleTests : IDisposable
         _client.UserQuit += (_, e) => quitEvents.Add(e);
         _client.PrivateMessageReceived += (_, e) => privateMessages.Add(e);
 
+        // Precondition: the server only sends RPL_MONOFFLINE for nicks we are monitoring.
+        MarkMonitored("Bob");
+
         await ProcessAsync($":irc.example.com {IrcNumericReplies.RPL_MONONLINE} observer :Bob!shareduser@host.test");
         await ProcessAsync($":irc.example.com {IrcNumericReplies.RPL_MONOFFLINE} observer :Bob");
         await ProcessAsync(":Bob2!shareduser@host.test PRIVMSG observer :hello-after-rename");
@@ -63,6 +66,9 @@ public sealed class IrcClientMonitorLifecycleTests : IDisposable
 
         _client.NickChanged += (_, e) => nickChanges.Add(e);
         _client.UserQuit += (_, e) => quitEvents.Add(e);
+
+        // Precondition: the server only sends RPL_MONOFFLINE for nicks we are monitoring.
+        MarkMonitored("Bob", "Alice");
 
         await ProcessAsync($":irc.example.com {IrcNumericReplies.RPL_MONONLINE} observer :Bob!shareduser@host.test");
         await ProcessAsync($":irc.example.com {IrcNumericReplies.RPL_MONONLINE} observer :Alice!shareduser@host.test");
@@ -87,6 +93,9 @@ public sealed class IrcClientMonitorLifecycleTests : IDisposable
         _client.NickChanged += (_, e) => nickChanges.Add(e);
         _client.UserQuit += (_, e) => quitEvents.Add(e);
 
+        // Precondition: the server only sends RPL_MONOFFLINE for nicks we are monitoring.
+        MarkMonitored("Bob");
+
         await ProcessAsync($":irc.example.com {IrcNumericReplies.RPL_MONONLINE} observer :Bob!shareduser@host.test");
         await ProcessAsync($":irc.example.com {IrcNumericReplies.RPL_MONOFFLINE} observer :Bob");
         await ProcessAsync(":Bob2!shareduser@host.test NOTICE observer :no-guess-notice");
@@ -102,6 +111,17 @@ public sealed class IrcClientMonitorLifecycleTests : IDisposable
     {
         var message = IrcMessage.Parse(rawMessage);
         await (Task)_processMessageAsync.Invoke(_client, [message])!;
+    }
+
+    private void MarkMonitored(params string[] nicks)
+    {
+        var set = (IRCDotNet.Core.Utilities.ConcurrentHashSet<string>)typeof(IrcClient)
+            .GetField("_monitoredNicks", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(_client)!;
+        foreach (var nick in nicks)
+        {
+            set.Add(nick);
+        }
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout)

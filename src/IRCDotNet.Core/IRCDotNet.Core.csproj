@@ -8,7 +8,7 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <PackageId>IRCDotNet.Core</PackageId>
-    <Version>2.5.1</Version>
+    <Version>2.5.2</Version>
     <Authors>Tushar Sudake</Authors>
     <Description>Modern .NET 8 IRC client library with full IRCv3 support — SASL, message tags, capabilities negotiation, CTCP (VERSION/PING/ACTION), WebSocket and TCP/SSL transports, rate limiting, auto-reconnect, typing indicator, MOTD, and 41 typed events. Based on RFC 1459 and the Modern IRC Client Protocol.</Description>
     <PackageTags>irc;irc-client;ircv3;internet-relay-chat;chat;networking;sasl;protocol;real-time;async;event-driven;rate-limiting;auto-reconnect;websocket;ctcp;typing;tagmsg;dotnet;csharp</PackageTags>
@@ -17,11 +17,19 @@
     <Copyright>Copyright (c) 2026 Tushar Sudake</Copyright>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageReleaseNotes>
-v2.5.1:
-- New: MotdReceived event — fires when the server's Message of the Day has been fully received (RPL_ENDOFMOTD 376)
-- New: MotdReceivedEvent class with IReadOnlyList&lt;string&gt; Lines property
-- MOTD lines accumulated between RPL_MOTDSTART (375) and RPL_ENDOFMOTD (376)
-- ERR_NOMOTD (422) handled gracefully (no event fired)
+v2.5.2 (reliability &amp; correctness hardening):
+- Fixed: nickname and channel identity comparisons now honour the server's CASEMAPPING (RFC 2812 §1.3) instead of ordinal comparison — "Nick[]" and "nick{}" are correctly treated as the same identity on rfc1459 networks (channel rosters, user tracking, echo detection, MONITOR)
+- New: UserQuitEvent.IsSynthetic — distinguishes a MONITOR-derived offline (RPL_MONOFFLINE) from a real QUIT
+- New: CtcpReplyEvent.IsEcho — echoed CTCP replies (echo-message capability) are now surfaced and flagged rather than dropped
+- New: IrcClientOptions.MonitorOfflineCorrelationWindowMs (default 750) — configurable window that suppresses a synthetic quit when a monitored nick flaps offline→online
+- Fixed: MONITOR offline finalization is now race-free; an offline immediately followed by online no longer emits a spurious quit
+- Fixed: a stray RPL_MONOFFLINE for a nick that is not (or no longer) monitored no longer manufactures a synthetic quit
+- New: ERR_MONLISTFULL (734) handling — rejected MONITOR targets are removed from the local set and surfaced via ErrorReplyReceived; RPL_MONLIST/RPL_ENDOFMONLIST (732/733) are routed
+- Fixed: registration NICK retries after ERR_NICKNAMEINUSE (433) are now bounded (max 5) and the fallback nick respects an advertised NICKLEN, instead of retrying forever
+- Fixed: negotiated ISUPPORT tokens (CASEMAPPING, CHANTYPES, …) reset on disconnect so a stale value cannot leak into the next connection
+- Fixed: MODE target classification now uses the server-advertised CHANTYPES instead of a hardcoded prefix set
+- Fixed: a failed JOIN no longer leaves an orphaned pending-NAMES buffer; a self-part before ENDOFNAMES no longer resurrects the channel
+- Hardened: disposal now drains queued events (including the final Disconnected) in order; reconnect attempt counting and channel-rejoin list handling are race-free
 - IIrcClient interface: 6 properties, 37 methods, 35 events
 
 Full changelog: https://github.com/etushar89/IRCDotNet.Core#changelog

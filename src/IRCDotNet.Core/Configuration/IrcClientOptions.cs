@@ -206,6 +206,14 @@ public class IrcClientOptions
     public int MaxReconnectDelayMs { get; set; } = 300000; // 5 minutes
 
     /// <summary>
+    /// Correlation window in milliseconds used to suppress a spurious synthetic <c>UserQuit</c> when a
+    /// MONITOR offline notification (RPL_MONOFFLINE) is immediately followed by a matching online
+    /// notification (RPL_MONONLINE) for the same nick — i.e. a brief nick flap. A larger value tolerates
+    /// slower flaps at the cost of delaying genuine offline events. Default: 750.
+    /// </summary>
+    public int MonitorOfflineCorrelationWindowMs { get; set; } = 750;
+
+    /// <summary>
     /// IRCv3 capabilities to request during CAP negotiation. Defaults to a comprehensive set including
     /// multi-prefix, away-notify, account-notify, extended-join, server-time, message-tags, batch, and more.
     /// </summary>
@@ -361,6 +369,9 @@ public class IrcClientOptions
         if (MaxReconnectDelayMs < ReconnectDelayMs)
             throw new ArgumentOutOfRangeException(nameof(MaxReconnectDelayMs), "Max reconnect delay must be >= reconnect delay");
 
+        if (MonitorOfflineCorrelationWindowMs < 0)
+            throw new ArgumentOutOfRangeException(nameof(MonitorOfflineCorrelationWindowMs), "Monitor offline correlation window cannot be negative");
+
         if (SendTimeoutMs <= 0)
             throw new ArgumentOutOfRangeException(nameof(SendTimeoutMs), "Send timeout must be positive");
 
@@ -402,6 +413,7 @@ public class IrcClientOptions
             MaxReconnectAttempts = MaxReconnectAttempts,
             ReconnectDelayMs = ReconnectDelayMs,
             MaxReconnectDelayMs = MaxReconnectDelayMs,
+            MonitorOfflineCorrelationWindowMs = MonitorOfflineCorrelationWindowMs,
             RequestedCapabilities = new List<string>(RequestedCapabilities),
             Encoding = Encoding,
             Sasl = Sasl?.Clone(),

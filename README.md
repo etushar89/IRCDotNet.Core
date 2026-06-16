@@ -279,10 +279,12 @@ client.NickChanged += (s, e) =>
     Console.WriteLine($"{e.OldNick} -> {e.NewNick}");
 
 client.UserQuit += (s, e) =>
-    Console.WriteLine($"{e.Nick} quit: {e.Reason}");
+    Console.WriteLine($"{e.Nick} quit: {e.Reason}{(e.IsSynthetic ? " (went offline)" : "")}");
 ```
 
 `MONITOR` does not infer nickname changes from later PMs, notices, or matching `user@host` identity. `NickChanged` is raised only when the server sends an explicit `NICK` event the client can observe. Otherwise, PM-only monitor tracking stays attached to the monitored nickname and `UserQuit` remains scoped to that nickname.
+
+When a monitored nick goes offline the client raises `UserQuit` with `IsSynthetic = true` (a real `QUIT` has `IsSynthetic = false`). To avoid a spurious quit when a nick briefly flaps offline→online, the synthetic quit is delayed by `IrcClientOptions.MonitorOfflineCorrelationWindowMs` (default `750` ms); a matching online notification within that window cancels it. Set it to `0` to emit synthetic quits immediately.
 
 ### Graceful Shutdown with Async Dispose
 
@@ -814,14 +816,31 @@ public class MyService(IrcClient client) { }  // also works, but not mockable
 
 ## Changelog
 
-### Unreleased
+### v2.5.2
 
-**Improvements:**
+**New Features:**
+- `UserQuitEvent.IsSynthetic` — distinguishes a MONITOR-derived offline notification (RPL_MONOFFLINE) from a real `QUIT`
+- `CtcpReplyEvent.IsEcho` — echoed CTCP replies (delivered via the `echo-message` capability) are now surfaced and flagged instead of being silently dropped
+- `IrcClientOptions.MonitorOfflineCorrelationWindowMs` (default `750`) — configurable window that suppresses a synthetic quit when a monitored nick flaps offline→online
+- `ERR_MONLISTFULL` (734) handling — rejected MONITOR targets are removed from the local set and surfaced via `ErrorReplyReceived`; `RPL_MONLIST`/`RPL_ENDOFMONLIST` (732/733) are routed
 - `extended-monitor` added to the default recommended IRCv3 capability set alongside `monitor`
-- Monitored PM-only contacts no longer infer nickname changes from monitor activity plus matching `user@host` identity
-- PM-only monitor tracking moves to a renamed nick only when the server exposes an explicit `NICK` event
+
+**Fixes:**
+- Nickname and channel identity comparisons now honour the server's `CASEMAPPING` (RFC 2812 §1.3) instead of ordinal comparison — on an `rfc1459` network `Nick[]` and `nick{}` are correctly treated as the same identity across channel rosters, user tracking, echo detection, and MONITOR
+- MONITOR offline finalization is now race-free; an offline immediately followed by online no longer emits a spurious synthetic quit
+- A stray `RPL_MONOFFLINE` for a nick that is not (or no longer) monitored no longer manufactures a synthetic quit
+- Registration `NICK` retries after `ERR_NICKNAMEINUSE` (433) are now bounded (max 5) and the fallback nick respects an advertised `NICKLEN`, instead of retrying indefinitely
+- Negotiated ISUPPORT tokens (`CASEMAPPING`, `CHANTYPES`, …) reset on disconnect so a stale value cannot leak into the next connection
+- `MODE` target classification now uses the server-advertised `CHANTYPES` instead of a hardcoded prefix set
+- A failed `JOIN` no longer leaves an orphaned pending-NAMES buffer; a self-part before `ENDOFNAMES` no longer resurrects the channel
+- Monitored PM-only contacts no longer infer nickname changes from monitor activity plus matching `user@host` identity; tracking moves to a renamed nick only when the server exposes an explicit `NICK` event
+
+**Hardening:**
+- Disposal now drains queued events (including the final `Disconnected`) in order rather than dropping them
+- Reconnect attempt counting and channel-rejoin list handling are now race-free
 
 **Tests:**
+- Added case-mapping, MONITOR list/correlation, bounded-433, NICKLEN-fallback, echoed-CTCP, ISUPPORT-reset, phantom-channel, and join-failure regression coverage
 - Updated unit coverage to enforce explicit-only monitor nickname handling
 - Updated live concurrency coverage to require explicit rename signals before transferring monitor state
 

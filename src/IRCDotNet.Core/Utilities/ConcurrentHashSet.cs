@@ -9,7 +9,24 @@ namespace IRCDotNet.Core.Utilities;
 /// <typeparam name="T">The type of elements in the set.</typeparam>
 public class ConcurrentHashSet<T> : ISet<T>, IReadOnlySet<T> where T : notnull
 {
-    private readonly ConcurrentDictionary<T, byte> _dictionary = new();
+    private readonly ConcurrentDictionary<T, byte> _dictionary;
+
+    /// <summary>
+    /// Initializes a new empty <see cref="ConcurrentHashSet{T}"/> using the default equality comparer.
+    /// </summary>
+    public ConcurrentHashSet()
+    {
+        _dictionary = new ConcurrentDictionary<T, byte>();
+    }
+
+    /// <summary>
+    /// Initializes a new empty <see cref="ConcurrentHashSet{T}"/> using the specified equality comparer.
+    /// </summary>
+    /// <param name="comparer">The equality comparer used to compare items in the set.</param>
+    public ConcurrentHashSet(IEqualityComparer<T> comparer)
+    {
+        _dictionary = new ConcurrentDictionary<T, byte>(comparer);
+    }
 
     /// <inheritdoc />
     public int Count => _dictionary.Count;

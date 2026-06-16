@@ -125,6 +125,13 @@ public class UserQuitEvent : IrcEvent
     public string? Reason { get; }
 
     /// <summary>
+    /// Whether this quit was synthesised by the client from a MONITOR offline notification
+    /// (RPL_MONOFFLINE) rather than a real QUIT message from the server. Synthetic quits are emitted
+    /// when a monitored nickname goes offline; they do not necessarily mean the user left the network.
+    /// </summary>
+    public bool IsSynthetic { get; }
+
+    /// <summary>
     /// Initializes a new <see cref="UserQuitEvent"/>.
     /// </summary>
     /// <param name="message">The raw IRC message.</param>
@@ -132,13 +139,15 @@ public class UserQuitEvent : IrcEvent
     /// <param name="user">Username (ident) of the user.</param>
     /// <param name="host">Hostname of the user.</param>
     /// <param name="reason">Optional quit message.</param>
-    public UserQuitEvent(IrcMessage message, string nick, string user, string host, string? reason = null)
+    /// <param name="isSynthetic">Whether this quit was synthesised from a MONITOR offline notification.</param>
+    public UserQuitEvent(IrcMessage message, string nick, string user, string host, string? reason = null, bool isSynthetic = false)
         : base(message)
     {
         Nick = nick;
         User = user;
         Host = host;
         Reason = reason;
+        IsSynthetic = isSynthetic;
     }
 }
 
@@ -1027,6 +1036,12 @@ public class CtcpReplyEvent : IrcEvent
     public string ReplyText { get; }
 
     /// <summary>
+    /// Whether this CTCP reply is an echo of one the client itself sent (delivered via the IRCv3
+    /// <c>echo-message</c> capability). <c>true</c> means the reply originated from this client.
+    /// </summary>
+    public bool IsEcho { get; }
+
+    /// <summary>
     /// Initializes a new <see cref="CtcpReplyEvent"/>.
     /// </summary>
     /// <param name="message">The raw IRC message.</param>
@@ -1035,7 +1050,8 @@ public class CtcpReplyEvent : IrcEvent
     /// <param name="host">Hostname of the sender.</param>
     /// <param name="command">The CTCP command name.</param>
     /// <param name="replyText">The reply text.</param>
-    public CtcpReplyEvent(IrcMessage message, string nick, string user, string host, string command, string replyText)
+    /// <param name="isEcho">Whether this reply is an echo of one the client itself sent.</param>
+    public CtcpReplyEvent(IrcMessage message, string nick, string user, string host, string command, string replyText, bool isEcho = false)
         : base(message)
     {
         Nick = nick;
@@ -1043,6 +1059,7 @@ public class CtcpReplyEvent : IrcEvent
         Host = host;
         Command = command;
         ReplyText = replyText;
+        IsEcho = isEcho;
     }
 }
 

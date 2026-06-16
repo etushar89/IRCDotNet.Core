@@ -18,7 +18,6 @@ namespace IRCDotNet.Core;
 public class IrcClient : IIrcClient
 {
     private static readonly Regex NickUserHostRegex = new(@"^([^!]+)!([^@]+)@(.+)$", RegexOptions.Compiled);
-    private static readonly TimeSpan MonitorOfflineCorrelationWindow = TimeSpan.FromMilliseconds(750);
 
     private readonly IrcClientOptions _options;
     private readonly ILogger? _logger;
@@ -30,6 +29,7 @@ public class IrcClient : IIrcClient
     private volatile int _eventDispatchClosed = 0;
     private volatile int _disposed = 0; // Use Interlocked for thread-safety
     private volatile int _isProcessingEventQueue;
+    private volatile Task _eventDispatchWorker = Task.CompletedTask; // Handle to the single in-flight dispatch worker, awaited during disposal drain
 
     // Cached collections to prevent excessive allocations
     private IReadOnlyDictionary<string, IReadOnlySet<string>>? _cachedChannels;
@@ -46,14 +46,22 @@ public class IrcClient : IIrcClient
     private volatile string _currentNick = string.Empty;
     private readonly ConcurrentHashSet<string> _supportedCapabilities = new();
     private readonly ConcurrentHashSet<string> _enabledCapabilities = new();
-    private readonly ConcurrentDictionary<string, ConcurrentHashSet<string>> _channels = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, PendingNamesState> _pendingNamesUsers = new(StringComparer.OrdinalIgnoreCase);
-    private DateTimeOffset _lastPongReceived = DateTimeOffset.UtcNow;
+    private readonly ConcurrentDictionary<string, ConcurrentHashSet<string>> _channels;
+    private readonly ConcurrentDictionary<string, PendingNamesState> _pendingNamesUsers;
+    // Stored as UTC ticks and accessed via Interlocked so the ping timer (which reads it under
+    // _stateLock) and HandlePong (which writes it from the read loop) never observe a torn
+    // DateTimeOffset value on 32-bit-sensitive paths.
+    private long _lastPongReceivedTicks = DateTimeOffset.UtcNow.UtcTicks;
     private volatile int _reconnectAttempts;
     private volatile List<string> _channelsToRejoin = new();
 
-    // NickServ state tracking
-    private volatile bool _nickServIdentified;
+    // NickServ state tracking (int for atomic CompareExchange test-and-set; 0 = not identified, 1 = identified)
+    private int _nickServIdentified;
+
+    // Bounded 433/436 fallback-nick retries during registration to avoid a retry storm when the server
+    // rejects every generated nick (e.g. restrictive nick policy, NICKLEN overflow). Reset on RPL_WELCOME.
+    private int _nickRetryCount;
+    private const int MaxNickRetries = 5;
 
     // MOTD accumulation buffer
     private List<string>? _motdBuffer;
@@ -61,9 +69,12 @@ public class IrcClient : IIrcClient
     // IRCv3 state tracking
     private volatile bool _saslInProgress;
     private volatile string? _currentSaslMechanism;
-    private readonly ConcurrentDictionary<string, UserInfo> _userInfo = new();
-    private readonly ConcurrentHashSet<string> _monitoredNicks = new();
-    private readonly ConcurrentDictionary<string, PendingMonitoredOffline> _pendingMonitoredOfflines = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, UserInfo> _userInfo;
+    private readonly ConcurrentHashSet<string> _monitoredNicks;
+    private readonly ConcurrentDictionary<string, PendingMonitoredOffline> _pendingMonitoredOfflines;
+    private readonly IEqualityComparer<string> _caseMappingComparer;
+    private readonly CancellationTokenSource _monitorOfflineCts = new();
+    private long _monitorOfflineSequence;
 
     // Protocol enhancements
     private readonly IrcRateLimiter _rateLimiter;
@@ -98,7 +109,7 @@ public class IrcClient : IIrcClient
                     if (!_channelsCacheValid || _cachedChannels == null)
                     {
                         // Create a safe snapshot of the channels collection with proper enumeration
-                        var channelSnapshot = new Dictionary<string, IReadOnlySet<string>>(StringComparer.OrdinalIgnoreCase);
+                        var channelSnapshot = new Dictionary<string, IReadOnlySet<string>>(_caseMappingComparer);
 
                         // Take a snapshot of the keys first to avoid enumeration modification
                         var channelKeys = _channels.Keys.ToArray();
@@ -278,6 +289,54 @@ public class IrcClient : IIrcClient
         // Initialize protocol enhancements
         _rateLimiter = new IrcRateLimiter();
         _isupportParser = new IsupportParser();
+
+        // Nick- and channel-keyed collections must compare keys using the server's negotiated
+        // CASEMAPPING (RFC 2812 §1.3), not ordinal/OrdinalIgnoreCase. The mapping is learned from
+        // ISUPPORT (005) during registration — before any of these collections are populated — so a
+        // comparer that resolves the mapping dynamically stays correct without rebuilds.
+        _caseMappingComparer = IrcCaseMapping.CreateComparer(() => _isupportParser.CaseMapping);
+        _channels = new ConcurrentDictionary<string, ConcurrentHashSet<string>>(_caseMappingComparer);
+        _pendingNamesUsers = new ConcurrentDictionary<string, PendingNamesState>(_caseMappingComparer);
+        _userInfo = new ConcurrentDictionary<string, UserInfo>(_caseMappingComparer);
+        _monitoredNicks = new ConcurrentHashSet<string>(_caseMappingComparer);
+        _pendingMonitoredOfflines = new ConcurrentDictionary<string, PendingMonitoredOffline>(_caseMappingComparer);
+    }
+
+    /// <summary>
+    /// Determines whether the supplied nickname refers to this client, using the server's
+    /// negotiated CASEMAPPING (RFC 2812 §1.3) rather than ordinal comparison.
+    /// </summary>
+    private bool IsSelf(string? nick)
+    {
+        return IrcCaseMapping.Equals(nick, _currentNick, _isupportParser.CaseMapping);
+    }
+
+    /// <summary>
+    /// Determines whether a MODE/notice target names a channel, using the server's advertised
+    /// CHANTYPES (ISUPPORT) rather than a hard-coded prefix set so non-default prefixes (e.g. <c>+</c>,
+    /// <c>!</c>) are recognised.
+    /// </summary>
+    private bool IsChannelTarget(string? target)
+    {
+        return !string.IsNullOrEmpty(target) && _isupportParser.ChannelTypes.IndexOf(target[0]) >= 0;
+    }
+
+    /// <summary>
+    /// Finds the index of the current nickname within the configured alternative-nick list using the
+    /// server's CASEMAPPING, or -1 if the current nick is not one of the configured alternatives.
+    /// </summary>
+    private int FindAlternativeNickIndex()
+    {
+        var mapping = _isupportParser.CaseMapping;
+        for (var i = 0; i < _options.AlternativeNicks.Count; i++)
+        {
+            if (IrcCaseMapping.Equals(_options.AlternativeNicks[i], _currentNick, mapping))
+            {
+                return i;
+            }
+        }
+
+        return -1;
     }
 
     /// <summary>
@@ -457,6 +516,10 @@ public class IrcClient : IIrcClient
             _monitoredNicks.Clear();
             _pendingMonitoredOfflines.Clear();
 
+            // Reset negotiated ISUPPORT tokens (CASEMAPPING, CHANTYPES, PREFIX, ...) so a stale value
+            // from the previous server cannot leak into the next connection before its 005 arrives.
+            _isupportParser.Clear();
+
             // Clear cached data
             _cachedChannels = null;
             _cachedEnabledCapabilities = null;
@@ -465,7 +528,7 @@ public class IrcClient : IIrcClient
             // Reset authentication state
             _saslInProgress = false;
             _currentSaslMechanism = null;
-            _lastPongReceived = DateTimeOffset.UtcNow;
+            Interlocked.Exchange(ref _lastPongReceivedTicks, DateTimeOffset.UtcNow.UtcTicks);
         }
 
         // Raise disconnect event only if we were actually connected
@@ -649,6 +712,17 @@ public class IrcClient : IIrcClient
     /// <exception cref="InvalidOperationException">Not connected to a server.</exception>
     public async Task SendRawWithCancellationAsync(string message, CancellationToken cancellationToken)
     {
+        await SendRawWithCancellationCoreAsync(message, cancellationToken, applyRateLimit: true).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Core implementation of <see cref="SendRawWithCancellationAsync"/> with an explicit rate-limit
+    /// toggle. Protocol-critical shutdown traffic (the graceful QUIT) passes <paramref name="applyRateLimit"/>
+    /// = <c>false</c> so it is never starved by a saturated user-message bucket — the same rationale as
+    /// the keepalive PING exemption.
+    /// </summary>
+    private async Task SendRawWithCancellationCoreAsync(string message, CancellationToken cancellationToken, bool applyRateLimit)
+    {
         if (string.IsNullOrWhiteSpace(message))
             throw new ArgumentException("Message cannot be null or empty", nameof(message));
 
@@ -682,8 +756,10 @@ public class IrcClient : IIrcClient
         using var combinedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, internalCancellationToken, timeoutCts.Token);
 
         // Apply rate limiting BEFORE acquiring the send lock to avoid holding the lock
-        // while waiting for rate limit tokens (which would starve all other senders)
-        if (_options.EnableRateLimit)
+        // while waiting for rate limit tokens (which would starve all other senders).
+        // Mirror SendRawCoreAsync's gating exactly: skip during registration (CAP/NICK/USER must not be
+        // delayed) and for protocol-critical frames passing applyRateLimit:false (e.g. the shutdown QUIT).
+        if (applyRateLimit && _options.EnableRateLimit && _isRegistered)
         {
             var rateLimitConfig = _options.RateLimitConfig ?? IrcRateLimiter.DefaultConfig;
             if (!_rateLimiter.IsAllowed("send", rateLimitConfig))
@@ -1049,13 +1125,9 @@ public class IrcClient : IIrcClient
 
     private async Task HandleUnexpectedDisconnectAsync(string reason)
     {
-        if (_options.AutoReconnect)
+        lock (_stateLock)
         {
-            _channelsToRejoin = _channels.Keys.ToList();
-        }
-        else
-        {
-            _channelsToRejoin = new();
+            _channelsToRejoin = _options.AutoReconnect ? _channels.Keys.ToList() : new List<string>();
         }
 
         await DisconnectInternalAsync(reason).ConfigureAwait(false);
@@ -1253,6 +1325,13 @@ public class IrcClient : IIrcClient
             case IrcNumericReplies.RPL_MONOFFLINE:
                 HandleMonitorOffline(message);
                 break;
+            case IrcNumericReplies.RPL_MONLIST:
+            case IrcNumericReplies.RPL_ENDOFMONLIST:
+                HandleMonitorList(message);
+                break;
+            case IrcNumericReplies.ERR_MONLISTFULL:
+                HandleMonitorListFull(message);
+                break;
 
             // Error Handling (RFC 1459 Section 6.1)
             case IrcNumericReplies.ERR_NOSUCHNICK:
@@ -1286,7 +1365,7 @@ public class IrcClient : IIrcClient
 
     private void HandlePong(IrcMessage message)
     {
-        _lastPongReceived = DateTimeOffset.UtcNow;
+        Interlocked.Exchange(ref _lastPongReceivedTicks, DateTimeOffset.UtcNow.UtcTicks);
     }
 
     private async Task HandleCapabilityAsync(IrcMessage message)
@@ -1608,7 +1687,11 @@ public class IrcClient : IIrcClient
     {
         var timeout = GetShutdownOperationTimeout();
         using var shutdownCancellation = new CancellationTokenSource(timeout);
-        var sendTask = SendRawWithCancellationAsync(quitMessage, shutdownCancellation.Token);
+        // Bypass the rate limiter: a graceful QUIT is protocol-critical shutdown traffic. If the
+        // user-message bucket is saturated (precisely when a clean disconnect matters most), a
+        // rate-limited QUIT could be delayed past the shutdown timeout and silently dropped, leaving
+        // the server to surface a generic "Connection reset" instead of the user's quit reason.
+        var sendTask = SendRawWithCancellationCoreAsync(quitMessage, shutdownCancellation.Token, applyRateLimit: false);
         try
         {
             await sendTask.WaitAsync(timeout).ConfigureAwait(false);
@@ -1733,9 +1816,13 @@ public class IrcClient : IIrcClient
         }
 
         // If it's us joining, add to our channel list
-        if (nick == _currentNick)
+        if (IsSelf(nick))
         {
-            _channels[channel] = new ConcurrentHashSet<string>();
+            _channels[channel] = new ConcurrentHashSet<string>(_caseMappingComparer);
+            // Pre-create the pending NAMES state so membership deltas (other users joining/parting)
+            // that arrive between our JOIN and the first RPL_NAMREPLY are captured as mutations and
+            // replayed on RPL_ENDOFNAMES, instead of being silently dropped by the roster rebuild.
+            _pendingNamesUsers[channel] = new PendingNamesState(_caseMappingComparer);
             InvalidateChannelsCache();
         }
         else
@@ -1767,7 +1854,7 @@ public class IrcClient : IIrcClient
         var (nick, user, host) = ParseNickUserHost(message.Source);
         var channel = message.Parameters[0];
         var reason = message.Parameters.Count > 1 ? message.Parameters[1] : null;        // If it's us leaving, remove from our channel list
-        if (nick == _currentNick)
+        if (IsSelf(nick))
         {
             _channels.TryRemove(channel, out _);
             _pendingNamesUsers.TryRemove(channel, out _);
@@ -1819,8 +1906,7 @@ public class IrcClient : IIrcClient
 
         // Detect echo-message: if the source nick is ourselves, this is our own echoed message.
         // Must be checked BEFORE CTCP detection — otherwise echoed CTCP requests trigger auto-replies to ourselves.
-        var isEcho = _enabledCapabilities.Contains("echo-message") &&
-                     string.Equals(nick, _currentNick, StringComparison.OrdinalIgnoreCase);
+        var isEcho = _enabledCapabilities.Contains("echo-message") && IsSelf(nick);
 
         // CTCP detection: messages starting with \x01 are CTCP requests.
         // Tolerate missing trailing \x01 (some clients/bouncers omit it).
@@ -1853,28 +1939,30 @@ public class IrcClient : IIrcClient
         var text = message.Parameters[1]; UpdateUserInfo(nick, user, host);
 
         // Skip echoed NOTICE — echo-message capability echoes our own CTCP replies back to us
-        var isEchoNotice = _enabledCapabilities.Contains("echo-message") &&
-                           string.Equals(nick, _currentNick, StringComparison.OrdinalIgnoreCase);
+        var isEchoNotice = _enabledCapabilities.Contains("echo-message") && IsSelf(nick);
 
         // CTCP reply detection: NOTICE messages starting with \x01 are CTCP replies.
         // Tolerate missing trailing \x01.
         if (text.Length >= 2 && text[0] == '\u0001')
         {
-            // Skip echoed CTCP replies — we sent this reply ourselves
-            if (isEchoNotice) return;
-
+            // Echoed CTCP replies (our own reply, delivered back via echo-message) are still surfaced
+            // so consumers can observe their outgoing CTCP traffic — but flagged via IsEcho so they can
+            // be distinguished from genuine remote replies. CTCP replies never trigger auto-responses,
+            // so processing an echo here is side-effect free.
             var ctcpContent = text[^1] == '\u0001' ? text[1..^1] : text[1..];
-            HandleCtcpReply(message, nick, user, host, ctcpContent);
+            HandleCtcpReply(message, nick, user, host, ctcpContent, isEchoNotice);
             return; // CTCP replies are not regular NOTICEs
         }
 
-        // Reactive NickServ identification: detect NickServ asking us to IDENTIFY
-        if (!_nickServIdentified
+        // Reactive NickServ identification: detect NickServ asking us to IDENTIFY.
+        // Gated on !isEchoNotice so an echoed outgoing NOTICE (only possible when our own nick is
+        // literally "NickServ") can never make us issue IDENTIFY against ourselves.
+        if (!isEchoNotice
             && !string.IsNullOrEmpty(_options.NickServPassword)
             && nick.Equals("NickServ", StringComparison.OrdinalIgnoreCase)
-            && text.Contains("IDENTIFY", StringComparison.OrdinalIgnoreCase))
+            && text.Contains("IDENTIFY", StringComparison.OrdinalIgnoreCase)
+            && Interlocked.CompareExchange(ref _nickServIdentified, 1, 0) == 0)
         {
-            _nickServIdentified = true;
             SafeFireAndForget(async () =>
             {
                 await SendMessageAsync("NickServ", $"IDENTIFY {_currentNick} {_options.NickServPassword}").ConfigureAwait(false);
@@ -1890,7 +1978,7 @@ public class IrcClient : IIrcClient
         if (message.Parameters.Count == 0 || string.IsNullOrEmpty(message.Source)) return;
 
         var (oldNick, user, host) = ParseNickUserHost(message.Source);
-        var newNick = message.Parameters[0].TrimStart(':');
+        var newNick = message.Parameters[0];
         ApplyNickChange(message, oldNick, newNick, user, host);
     }
 
@@ -1915,7 +2003,7 @@ public class IrcClient : IIrcClient
         var reason = message.Parameters.Count > 2 ? message.Parameters[2] : null;
 
         // If it's us being kicked
-        if (kickedNick == _currentNick)
+        if (IsSelf(kickedNick))
         {
             _channels.TryRemove(channel, out _);
             _pendingNamesUsers.TryRemove(channel, out _);
@@ -1981,6 +2069,7 @@ public class IrcClient : IIrcClient
     {
         _isRegistered = true;
         _reconnectAttempts = 0;
+        Interlocked.Exchange(ref _nickRetryCount, 0);
 
         // Extract our nick from the welcome message
         if (message.Parameters.Count > 0)
@@ -1993,7 +2082,7 @@ public class IrcClient : IIrcClient
         }
 
         // Reset NickServ state for this connection
-        _nickServIdentified = false;
+        Interlocked.Exchange(ref _nickServIdentified, 0);
 
         var network = message.Source ?? "Unknown";
         RaiseEventAsync(Connected, new ConnectedEvent(message, network, _currentNick));
@@ -2010,7 +2099,7 @@ public class IrcClient : IIrcClient
         var channel = message.Parameters[2];
         var userList = message.Parameters[3];
 
-        var pendingNamesState = _pendingNamesUsers.GetOrAdd(channel, static _ => new PendingNamesState());
+        var pendingNamesState = _pendingNamesUsers.GetOrAdd(channel, _ => new PendingNamesState(_caseMappingComparer));
 
         var users = ParseChannelUsers(userList);
         foreach (var user in users)
@@ -2027,7 +2116,7 @@ public class IrcClient : IIrcClient
 
         if (_pendingNamesUsers.TryRemove(channel, out var pendingNamesState))
         {
-            var usersByNick = new Dictionary<string, ChannelUser>(pendingNamesState.Snapshot, StringComparer.OrdinalIgnoreCase);
+            var usersByNick = new Dictionary<string, ChannelUser>(pendingNamesState.Snapshot, _caseMappingComparer);
 
             while (pendingNamesState.Mutations.TryDequeue(out var mutation))
             {
@@ -2035,7 +2124,7 @@ public class IrcClient : IIrcClient
             }
 
             var replacementUsers = usersByNick.Values.ToList();
-            var replacementSet = new ConcurrentHashSet<string>();
+            var replacementSet = new ConcurrentHashSet<string>(_caseMappingComparer);
 
             foreach (var user in replacementUsers)
             {
@@ -2137,7 +2226,7 @@ public class IrcClient : IIrcClient
         // 001 RPL_WELCOME that the server will never send.
         if (_options.AlternativeNicks.Count > 0)
         {
-            var currentIndex = _options.AlternativeNicks.IndexOf(_currentNick);
+            var currentIndex = FindAlternativeNickIndex();
             if (currentIndex >= 0 && currentIndex < _options.AlternativeNicks.Count - 1)
             {
                 _currentNick = _options.AlternativeNicks[currentIndex + 1];
@@ -2149,13 +2238,69 @@ public class IrcClient : IIrcClient
         // Millisecond-precision suffix (4 decimal digits) so a back-to-back 433 round-trip
         // produces a different fallback nick rather than the same one — the original
         // ToUnixTimeSeconds() formulation could re-emit the identical NICK within one second
-        // and risk a server-side flood disconnect. Length is preserved at 4 digits to keep
-        // total nick length under typical 16/30-char network caps.
-        var suffix = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() % 10000;
-        _currentNick = $"{_options.Nick}{suffix:D4}";
-        _logger?.LogInformation("Sent NICK retry '{Nick}' after 433 with no usable alternatives", _currentNick);
+        // and risk a server-side flood disconnect.
+        //
+        // Bounded retries: if the server rejects every generated fallback (restrictive nick policy,
+        // NICKLEN overflow surfacing as 432, collision storms during netsplit recovery), giving up and
+        // disconnecting is preferable to an unbounded NICK retry storm that the server flood-kills.
+        var attempt = Interlocked.Increment(ref _nickRetryCount);
+        if (attempt > MaxNickRetries)
+        {
+            _logger?.LogError("Exhausted {Max} NICK fallback retries during registration; aborting connection", MaxNickRetries);
+            RaiseEventAsync(ErrorReplyReceived, new ErrorReplyEvent(message, message.Command, _currentNick ?? string.Empty, $"Exhausted {MaxNickRetries} nickname retries during registration"));
+            await DisconnectInternalAsync("Nickname registration failed").ConfigureAwait(false);
+            return;
+        }
+
+        var suffix = (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() % 10000).ToString("D4", System.Globalization.CultureInfo.InvariantCulture);
+        _currentNick = BuildFallbackNick(suffix);
+        _logger?.LogInformation("Sent NICK retry '{Nick}' after 433 (attempt {Attempt}/{Max})", _currentNick, attempt, MaxNickRetries);
         await SendRawAsync($"NICK {_currentNick}").ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Builds a registration fallback nickname that fits within the server's advertised NICKLEN.
+    /// The configured base nick is truncated as needed to leave room for <paramref name="suffix"/>; if the
+    /// base is empty or starts with a character the RFC 2812 §2.3.1 grammar disallows, a known-safe
+    /// <c>Guest</c> template is used instead.
+    /// </summary>
+    private string BuildFallbackNick(string suffix)
+    {
+        var baseNick = _options.Nick ?? string.Empty;
+
+        if (!IsValidNickStart(baseNick))
+        {
+            baseNick = "Guest";
+        }
+
+        // Only constrain the length when the server has actually advertised a NICKLEN. The RFC 2812
+        // default of 9 is far shorter than what modern networks permit, so truncating to it when the
+        // real limit is unknown would needlessly mangle a base nick the server already accepted during
+        // the initial registration handshake.
+        if (!_isupportParser.GetBoolValue("NICKLEN"))
+        {
+            return baseNick + suffix;
+        }
+
+        var maxLen = Math.Max(1, _isupportParser.MaxNicknameLength);
+
+        // No room for any base characters — return as much of the suffix as fits.
+        if (suffix.Length >= maxLen)
+        {
+            return suffix.Length <= maxLen ? suffix : suffix[..maxLen];
+        }
+
+        var room = maxLen - suffix.Length;
+        if (baseNick.Length > room)
+        {
+            baseNick = baseNick[..room];
+        }
+
+        return baseNick + suffix;
+    }
+
+    private static bool IsValidNickStart(string nick) =>
+        !string.IsNullOrEmpty(nick) && (char.IsLetter(nick[0]) || "[]\\`_^{|}".IndexOf(nick[0]) >= 0);
 
     private async Task HandleNicknameCollisionAsync(IrcMessage message)
     {
@@ -2174,7 +2319,7 @@ public class IrcClient : IIrcClient
             // First, try alternative nicknames if we have them
             if (_options.AlternativeNicks.Count > 0)
             {
-                var currentIndex = _options.AlternativeNicks.IndexOf(_currentNick);
+                var currentIndex = FindAlternativeNickIndex();
                 if (currentIndex >= 0 && currentIndex < _options.AlternativeNicks.Count - 1)
                 {
                     fallbackNick = _options.AlternativeNicks[currentIndex + 1];
@@ -2186,7 +2331,7 @@ public class IrcClient : IIrcClient
                 {
                     // All alternative nicks exhausted, generate a unique nick
                     var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds() % 10000;
-                    var random = new Random().Next(10, 99);
+                    var random = Random.Shared.Next(10, 99);
                     fallbackNick = $"{_options.Nick}_{timestamp}_{random}";
                     _currentNick = fallbackNick;
                     await SendRawAsync($"NICK {_currentNick}").ConfigureAwait(false);
@@ -2197,7 +2342,7 @@ public class IrcClient : IIrcClient
             {
                 // No alternative nicks configured, generate a unique nick based on the original
                 var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds() % 10000;
-                var random = new Random().Next(10, 99);
+                var random = Random.Shared.Next(10, 99);
                 fallbackNick = $"{_options.Nick}_{timestamp}_{random}";
                 _currentNick = fallbackNick;
                 await SendRawAsync($"NICK {_currentNick}").ConfigureAwait(false);
@@ -2212,7 +2357,7 @@ public class IrcClient : IIrcClient
 
             // Try to change to a safe nickname
             var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds() % 10000;
-            var random = new Random().Next(10, 99);
+            var random = Random.Shared.Next(10, 99);
             fallbackNick = $"Guest_{timestamp}_{random}";
             _currentNick = fallbackNick;
 
@@ -2284,7 +2429,8 @@ public class IrcClient : IIrcClient
                 isConnected = _isConnected;
 
                 // Check if we've received a pong recently while holding the lock
-                if (isConnected && DateTimeOffset.UtcNow - _lastPongReceived > TimeSpan.FromMilliseconds(_options.PingTimeoutMs))
+                var lastPong = new DateTimeOffset(Interlocked.Read(ref _lastPongReceivedTicks), TimeSpan.Zero);
+                if (isConnected && DateTimeOffset.UtcNow - lastPong > TimeSpan.FromMilliseconds(_options.PingTimeoutMs))
                 {
                     _logger?.LogWarning("Ping timeout, disconnecting");
                     shouldDisconnect = true;
@@ -2319,26 +2465,45 @@ public class IrcClient : IIrcClient
 
     private async Task AttemptReconnectAsync()
     {
+        // _disposed is volatile, so a direct read already carries acquire semantics.
+        if (_disposed != 0)
+        {
+            return;
+        }
+
         if (_options.MaxReconnectAttempts > 0 && _reconnectAttempts >= _options.MaxReconnectAttempts)
         {
             _logger?.LogWarning("Maximum reconnection attempts reached");
             return;
         }
 
-        _reconnectAttempts++;
-        var delay = Math.Min(_options.ReconnectDelayMs * _reconnectAttempts, _options.MaxReconnectDelayMs);
+        // Atomic increment guards against multiple concurrent reconnect chains (e.g. a ping-timeout and
+        // a read-loop failure both scheduling a reconnect) racing to bump the counter.
+        var attempt = Interlocked.Increment(ref _reconnectAttempts);
+        var delay = Math.Min(_options.ReconnectDelayMs * attempt, _options.MaxReconnectDelayMs);
 
-        _logger?.LogInformation("Attempting to reconnect in {Delay}ms (attempt {Attempt})", delay, _reconnectAttempts);
+        _logger?.LogInformation("Attempting to reconnect in {Delay}ms (attempt {Attempt})", delay, attempt);
         await Task.Delay(delay).ConfigureAwait(false);
+
+        if (_disposed != 0)
+        {
+            return;
+        }
 
         try
         {
             await ConnectAsync().ConfigureAwait(false);
             _logger?.LogInformation("Reconnection successful");
 
-            // Rejoin channels that were active before disconnect
-            var channelsToRejoin = _channelsToRejoin;
-            _channelsToRejoin = new();
+            // Rejoin channels that were active before disconnect. Swap the list out atomically under the
+            // state lock so a concurrent disconnect cannot lose or double-process the rejoin set.
+            List<string> channelsToRejoin;
+            lock (_stateLock)
+            {
+                channelsToRejoin = _channelsToRejoin;
+                _channelsToRejoin = new List<string>();
+            }
+
             foreach (var channel in channelsToRejoin)
             {
                 try
@@ -2354,8 +2519,9 @@ public class IrcClient : IIrcClient
         catch (Exception ex)
         {
             _logger?.LogError(ex, "Reconnection failed");
-            // Use a small delay before scheduling next attempt to prevent tight loops
-            if (_reconnectAttempts < _options.MaxReconnectAttempts || _options.MaxReconnectAttempts <= 0)
+            // Schedule the next attempt unless we've been disposed or hit the attempt ceiling.
+            if (_disposed == 0 &&
+                (_options.MaxReconnectAttempts <= 0 || attempt < _options.MaxReconnectAttempts))
             {
                 SafeFireAndForget(async () =>
                 {
@@ -2536,6 +2702,17 @@ public class IrcClient : IIrcClient
             // Don't block - just signal cancellation and cleanup synchronously
             _cancellationTokenSource?.Cancel();
 
+            // Cancel and release the monitor-offline correlation source so its pending finalizers abort
+            // promptly instead of waiting out the correlation window.
+            try
+            {
+                _monitorOfflineCts.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Already disposed via a prior DisposeAsync; nothing to do.
+            }
+
             // Clean up rate limiter buckets to prevent memory leaks
             _rateLimiter?.Cleanup(TimeSpan.FromHours(1));
 
@@ -2556,6 +2733,8 @@ public class IrcClient : IIrcClient
 
             _isConnected = false;
 
+            _monitorOfflineCts.Dispose();
+            _cancellationTokenSource?.Dispose();
             _sendLock?.Dispose();
             _connectLock?.Dispose();
         }
@@ -2584,8 +2763,26 @@ public class IrcClient : IIrcClient
         }
         finally
         {
+            // Stop accepting new event dispatches, then drain those already queued (e.g. the final
+            // Disconnected notification raised by DisconnectInternalAsync) so subscribers are not
+            // silently dropped when the client is disposed.
             Interlocked.Exchange(ref _eventDispatchClosed, 1);
+            await DrainPendingEventDispatchesAsync().ConfigureAwait(false);
+
             Interlocked.Exchange(ref _disposed, 1);
+
+            // Cancel and release the monitor-offline correlation source and the main cancellation source.
+            try
+            {
+                _monitorOfflineCts.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Already disposed via a prior synchronous Dispose; nothing to do.
+            }
+
+            _monitorOfflineCts.Dispose();
+            _cancellationTokenSource?.Dispose();
             _sendLock?.Dispose();
             _connectLock?.Dispose();
             GC.SuppressFinalize(this);
@@ -2634,7 +2831,39 @@ public class IrcClient : IIrcClient
         if (Interlocked.CompareExchange(ref _isProcessingEventQueue, 1, 0) != 0)
             return;
 
-        SafeFireAndForget(ProcessPendingEventDispatchesAsync, "ProcessPendingEventDispatches");
+        // Capture the worker task so disposal can await in-flight delivery instead of racing the queue
+        // with a second consumer. ProcessPendingEventDispatchesAsync handles its own exceptions, so the
+        // fire-and-forget task never faults unobserved.
+        _eventDispatchWorker = Task.Run(ProcessPendingEventDispatchesAsync);
+    }
+
+    /// <summary>
+    /// Awaits delivery of any event dispatches already queued (e.g. the final Disconnected notification
+    /// raised by <see cref="DisconnectInternalAsync"/>) so subscribers are not silently dropped when the
+    /// client is disposed. Called during disposal after the dispatch queue is closed to new entries.
+    /// </summary>
+    /// <remarks>
+    /// This deliberately does not dequeue items itself: a second consumer would break the strict,
+    /// single-consumer, in-order delivery guarantee (a later event could run while an earlier blocked
+    /// handler is still in flight). Instead it ensures the single worker is active and awaits it,
+    /// looping until the queue is empty and no worker remains active.
+    /// </remarks>
+    private async Task DrainPendingEventDispatchesAsync()
+    {
+        // _isProcessingEventQueue is volatile, so a direct read carries the needed acquire semantics.
+        while (!_pendingEventDispatches.IsEmpty || _isProcessingEventQueue == 1)
+        {
+            StartPendingEventDispatchProcessing();
+
+            try
+            {
+                await _eventDispatchWorker.ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Error awaiting event dispatch worker during dispose drain");
+            }
+        }
     }
 
     private async Task ProcessPendingEventDispatchesAsync()
@@ -2748,7 +2977,7 @@ public class IrcClient : IIrcClient
                 var target = message.Parameters.Count > 0 ? message.Parameters[0] : string.Empty;
 
                 // Ignore typing notifications from ourselves
-                if (string.Equals(nick, _currentNick, StringComparison.OrdinalIgnoreCase))
+                if (IsSelf(nick))
                     return;
 
                 var state = typingValue switch
@@ -2831,16 +3060,16 @@ public class IrcClient : IIrcClient
         }
     }
 
-    private void HandleCtcpReply(IrcMessage message, string nick, string user, string host, string ctcpContent)
+    private void HandleCtcpReply(IrcMessage message, string nick, string user, string host, string ctcpContent, bool isEcho = false)
     {
         var spaceIndex = ctcpContent.IndexOf(' ');
         var command = spaceIndex == -1 ? ctcpContent : ctcpContent[..spaceIndex];
         var replyText = spaceIndex == -1 ? string.Empty : ctcpContent[(spaceIndex + 1)..];
         command = command.ToUpperInvariant();
 
-        _logger?.LogDebug("CTCP {Command} reply from {Nick}: {Reply}", command, nick, replyText);
+        _logger?.LogDebug("CTCP {Command} reply from {Nick}: {Reply} (echo: {IsEcho})", command, nick, replyText, isEcho);
 
-        RaiseEventAsync(CtcpReplyReceived, new CtcpReplyEvent(message, nick, user, host, command, replyText));
+        RaiseEventAsync(CtcpReplyReceived, new CtcpReplyEvent(message, nick, user, host, command, replyText, isEcho));
     }
 
     private void UpdateUserInfo(string nick, string? user = null, string? host = null, string? account = null, string? realName = null, string? awayMessage = null, bool? isAway = null)
@@ -2894,10 +3123,45 @@ public class IrcClient : IIrcClient
 
         foreach (var target in ParseMonitorTargets(message.Parameters[^1]))
         {
+            // Ignore offline notifications for nicks we are not (or no longer) monitoring. A stray
+            // RPL_MONOFFLINE (e.g. arriving after we issued MONITOR -, or for a nick we never added)
+            // must not manufacture a synthetic UserQuit for a user the consumer never asked about.
+            if (!_monitoredNicks.Contains(target.Nick))
+            {
+                continue;
+            }
+
             var pending = CreatePendingMonitoredOffline(message, target.Nick);
             _pendingMonitoredOfflines[target.Nick] = pending;
             SafeFireAndForget(() => FinalizePendingMonitoredOfflineAsync(pending), $"MonitorOffline_{target.Nick}");
         }
+    }
+
+    private void HandleMonitorList(IrcMessage message)
+    {
+        // RPL_MONLIST (732) / RPL_ENDOFMONLIST (733): response to "MONITOR L". The client does not keep
+        // a server-authoritative mirror, but routing these prevents them from being silently dropped
+        // and surfaces the data for diagnostics.
+        _logger?.LogDebug("MONITOR list reply ({Command}): {Targets}",
+            message.Command, message.Parameters.Count > 1 ? message.Parameters[^1] : string.Empty);
+    }
+
+    private void HandleMonitorListFull(IrcMessage message)
+    {
+        // ERR_MONLISTFULL (734): "<nick> <limit> <targets> :Monitor list is full." The listed targets
+        // were rejected by the server and are NOT on the server-side monitor list, so remove them from
+        // our local set to keep client and server state consistent.
+        var limit = message.Parameters.Count > 1 ? message.Parameters[1] : "?";
+        var rejectedTargets = message.Parameters.Count > 2 ? message.Parameters[2] : string.Empty;
+
+        foreach (var rejected in rejectedTargets.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            _monitoredNicks.Remove(rejected);
+        }
+
+        var reason = message.Parameters.Count > 3 ? message.Parameters[3] : "Monitor list is full";
+        _logger?.LogWarning("MONITOR list full (limit {Limit}); rejected targets dropped from local set: {Targets}", limit, rejectedTargets);
+        RaiseEventAsync(ErrorReplyReceived, new ErrorReplyEvent(message, message.Command, rejectedTargets, reason));
     }
 
     private void ApplyNickChange(IrcMessage message, string oldNick, string newNick, string user, string host)
@@ -2914,7 +3178,7 @@ public class IrcClient : IIrcClient
 
         lock (_stateLock)
         {
-            if (oldNick == _currentNick)
+            if (IsSelf(oldNick))
             {
                 _currentNick = newNick;
             }
@@ -2932,7 +3196,22 @@ public class IrcClient : IIrcClient
                 userInfo.Nick = newNick;
                 if (!string.IsNullOrEmpty(user) && string.IsNullOrEmpty(userInfo.User)) userInfo.User = user;
                 if (!string.IsNullOrEmpty(host) && string.IsNullOrEmpty(userInfo.Host)) userInfo.Host = host;
-                _userInfo[newNick] = userInfo;
+
+                // If a stale entry already exists under newNick (e.g. a missed QUIT, or 436 collision
+                // recovery), carry over any fields the renamed user's record doesn't supply instead of
+                // silently dropping them.
+                _userInfo.AddOrUpdate(newNick, userInfo, (_, existing) =>
+                {
+                    lock (existing)
+                    {
+                        if (string.IsNullOrEmpty(userInfo.User) && !string.IsNullOrEmpty(existing.User)) userInfo.User = existing.User;
+                        if (string.IsNullOrEmpty(userInfo.Host) && !string.IsNullOrEmpty(existing.Host)) userInfo.Host = existing.Host;
+                        if (string.IsNullOrEmpty(userInfo.Account) && !string.IsNullOrEmpty(existing.Account)) userInfo.Account = existing.Account;
+                        if (string.IsNullOrEmpty(userInfo.RealName) && !string.IsNullOrEmpty(existing.RealName)) userInfo.RealName = existing.RealName;
+                    }
+
+                    return userInfo;
+                });
             }
             else
             {
@@ -2954,35 +3233,51 @@ public class IrcClient : IIrcClient
 
     private PendingMonitoredOffline CreatePendingMonitoredOffline(IrcMessage message, string nick)
     {
+        var sequence = Interlocked.Increment(ref _monitorOfflineSequence);
         if (_userInfo.TryGetValue(nick, out var userInfo))
         {
             lock (userInfo)
             {
-                return new PendingMonitoredOffline(message, nick, userInfo.User, userInfo.Host, DateTimeOffset.UtcNow);
+                return new PendingMonitoredOffline(message, nick, userInfo.User, userInfo.Host, DateTimeOffset.UtcNow, sequence);
             }
         }
 
-        return new PendingMonitoredOffline(message, nick, string.Empty, string.Empty, DateTimeOffset.UtcNow);
+        return new PendingMonitoredOffline(message, nick, string.Empty, string.Empty, DateTimeOffset.UtcNow, sequence);
     }
 
     private async Task FinalizePendingMonitoredOfflineAsync(PendingMonitoredOffline pending)
     {
-        await Task.Delay(MonitorOfflineCorrelationWindow).ConfigureAwait(false);
+        try
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(_options.MonitorOfflineCorrelationWindowMs), _monitorOfflineCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Client is disconnecting/disposing — abandon the pending offline without emitting a quit.
+            return;
+        }
 
-        if (!_pendingMonitoredOfflines.TryGetValue(pending.Nick, out var current) || current.Timestamp != pending.Timestamp)
+        // Atomically remove only if THIS exact pending offline is still the current one. The unique
+        // Sequence makes the record's value-equality behave as identity, so a racing RPL_MONONLINE
+        // (which removes the entry) or a newer RPL_MONOFFLINE (which replaces it) both make this remove
+        // fail — preventing a spurious synthetic UserQuit. This closes the TOCTOU window that a separate
+        // TryGetValue + TryRemove pair would leave open.
+        if (!_pendingMonitoredOfflines.TryRemove(new KeyValuePair<string, PendingMonitoredOffline>(pending.Nick, pending)))
         {
             return;
         }
 
-        _pendingMonitoredOfflines.TryRemove(pending.Nick, out _);
         _userInfo.TryRemove(pending.Nick, out _);
-        RaiseEventAsync(UserQuit, new UserQuitEvent(pending.Message, pending.Nick, pending.User, pending.Host));
+        RaiseEventAsync(UserQuit, new UserQuitEvent(pending.Message, pending.Nick, pending.User, pending.Host, reason: null, isSynthetic: true));
     }
 
     private async Task RefreshMonitoredNickAsync(string oldNick, string newNick)
     {
         if (!SupportsMonitorCapability() || !_isConnected)
         {
+            // We cannot propagate the monitor rename to the server, so newNick is not actually being
+            // monitored. Reflect that locally (oldNick was already removed optimistically by the caller).
+            _monitoredNicks.Remove(newNick);
             return;
         }
 
@@ -2993,7 +3288,10 @@ public class IrcClient : IIrcClient
         }
         catch (Exception ex)
         {
-            _logger?.LogDebug(ex, "Failed to refresh MONITOR target from {OldNick} to {NewNick}", oldNick, newNick);
+            // The rename could not be fully propagated. Drop newNick from the local set so it does not
+            // falsely appear monitored; this keeps client state from diverging from the server.
+            _monitoredNicks.Remove(newNick);
+            _logger?.LogDebug(ex, "Failed to refresh MONITOR target from {OldNick} to {NewNick}; dropped {DroppedNick} from local monitor set", oldNick, newNick, newNick);
         }
     }
 
@@ -3170,7 +3468,12 @@ public class IrcClient : IIrcClient
 
     private sealed class PendingNamesState
     {
-        public ConcurrentDictionary<string, ChannelUser> Snapshot { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public PendingNamesState(IEqualityComparer<string> comparer)
+        {
+            Snapshot = new ConcurrentDictionary<string, ChannelUser>(comparer);
+        }
+
+        public ConcurrentDictionary<string, ChannelUser> Snapshot { get; }
 
         public ConcurrentQueue<PendingNamesMutation> Mutations { get; } = new();
     }
@@ -3184,7 +3487,7 @@ public class IrcClient : IIrcClient
 
     private sealed record PendingNamesMutation(PendingNamesMutationKind Kind, string Nick, string? NewNick = null);
 
-    private sealed record PendingMonitoredOffline(IrcMessage Message, string Nick, string User, string Host, DateTimeOffset Timestamp);
+    private sealed record PendingMonitoredOffline(IrcMessage Message, string Nick, string User, string Host, DateTimeOffset Timestamp, long Sequence);
 
     private void HandleErrorReply(IrcMessage message)
     {
@@ -3218,6 +3521,7 @@ public class IrcClient : IIrcClient
             case IrcNumericReplies.ERR_TOOMANYCHANNELS: // 405
                 _logger?.LogWarning("Cannot join channel {Channel}: {Reason}", errorMessage, reason);
                 _channels.TryRemove(errorMessage, out _);
+                _pendingNamesUsers.TryRemove(errorMessage, out _);
                 RaiseEventAsync(ChannelJoinFailed, new ChannelJoinFailedEvent(message, errorMessage, reason, message.Command));
                 break;
             case IrcNumericReplies.ERR_CHANOPRIVSNEEDED:
@@ -3246,7 +3550,7 @@ public class IrcClient : IIrcClient
 
         var source = string.IsNullOrEmpty(message.Source) ? null : ParseNickUserHost(message.Source).nick;
 
-        if (target.StartsWith("#") || target.StartsWith("&"))
+        if (IsChannelTarget(target))
         {
             // Channel mode change
             _logger?.LogDebug("Channel mode change on {Channel}: {Modes} by {Source}", target, modes, source);
@@ -3257,7 +3561,7 @@ public class IrcClient : IIrcClient
             _logger?.LogDebug("User mode change for {User}: {Modes} by {Source}", target, modes, source);
 
             // If it's our own mode change, we might want to track it
-            if (target == _currentNick)
+            if (IsSelf(target))
             {
                 _logger?.LogInformation("Our user modes changed: {Modes}", modes);
             }

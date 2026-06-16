@@ -609,7 +609,7 @@ public class IrcClientTests : IDisposable
         SetPrivateField(client, "_cancellationTokenSource", new CancellationTokenSource());
         SetPrivateField(client, "_isConnected", true);
         SetPrivateField(client, "_currentNick", options.Nick);
-        SetPrivateField(client, "_lastPongReceived", DateTimeOffset.UtcNow - TimeSpan.FromMilliseconds(options.PingTimeoutMs + 100));
+        SetPrivateField(client, "_lastPongReceivedTicks", (DateTimeOffset.UtcNow - TimeSpan.FromMilliseconds(options.PingTimeoutMs + 100)).UtcTicks);
 
         var channels = GetPrivateField<ConcurrentDictionary<string, IRCDotNet.Core.Utilities.ConcurrentHashSet<string>>>(client, "_channels");
         channels.Should().NotBeNull();

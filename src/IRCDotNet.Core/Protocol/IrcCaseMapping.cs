@@ -214,6 +214,20 @@ public static class IrcCaseMapping
     }
 
     /// <summary>
+    /// Creates a string comparer for IRC case mapping that resolves the mapping dynamically on each
+    /// comparison. Use this when the server's CASEMAPPING is not yet known at construction time
+    /// (it is learned from ISUPPORT 005 during registration) so collections keyed by nickname or
+    /// channel name automatically respect the negotiated mapping.
+    /// </summary>
+    /// <param name="mappingProvider">A callback returning the case mapping currently in effect.</param>
+    /// <returns>An <see cref="IEqualityComparer{T}"/> that compares strings using the live IRC case rules.</returns>
+    public static IEqualityComparer<string> CreateComparer(Func<CaseMappingType> mappingProvider)
+    {
+        ArgumentNullException.ThrowIfNull(mappingProvider);
+        return new DynamicIrcCaseComparer(mappingProvider);
+    }
+
+    /// <summary>
     /// String comparer that uses IRC case mapping
     /// </summary>
     private class IrcCaseComparer : IEqualityComparer<string>
@@ -233,6 +247,29 @@ public static class IrcCaseMapping
         public int GetHashCode(string obj)
         {
             return IrcCaseMapping.GetHashCode(obj, _mappingType);
+        }
+    }
+
+    /// <summary>
+    /// String comparer that resolves the IRC case mapping dynamically on each comparison.
+    /// </summary>
+    private sealed class DynamicIrcCaseComparer : IEqualityComparer<string>
+    {
+        private readonly Func<CaseMappingType> _mappingProvider;
+
+        public DynamicIrcCaseComparer(Func<CaseMappingType> mappingProvider)
+        {
+            _mappingProvider = mappingProvider;
+        }
+
+        public bool Equals(string? x, string? y)
+        {
+            return IrcCaseMapping.Equals(x, y, _mappingProvider());
+        }
+
+        public int GetHashCode(string obj)
+        {
+            return IrcCaseMapping.GetHashCode(obj, _mappingProvider());
         }
     }
 }
